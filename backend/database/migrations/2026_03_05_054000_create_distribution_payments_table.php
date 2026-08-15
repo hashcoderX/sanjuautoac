@@ -1,0 +1,32 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+    public function up(): void
+    {
+        Schema::create('distribution_payments', function (Blueprint $table) {
+            $table->id();
+            $table->string('payment_number', 60)->unique();
+            $table->foreignId('distribution_invoice_id')->nullable()->constrained('distribution_invoices')->nullOnDelete();
+            $table->foreignId('load_id')->nullable()->constrained('loads')->nullOnDelete();
+            $table->foreignId('customer_id')->constrained('distribution_customers')->cascadeOnDelete();
+            $table->date('payment_date');
+            $table->decimal('amount', 12, 2)->default(0);
+            $table->enum('payment_method', ['check', 'cash', 'bank_transfer']);
+            $table->string('reference_no', 100)->nullable();
+            $table->string('bank_name')->nullable();
+            $table->enum('status', ['received', 'cleared', 'bounced', 'pending'])->default('received');
+            $table->text('notes')->nullable();
+            $table->unsignedBigInteger('received_by')->nullable();
+            $table->timestamps();
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('distribution_payments');
+    }
+};

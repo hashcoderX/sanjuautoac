@@ -1,0 +1,38 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('outlet_sale_items', function (Blueprint $table) {
+            if (!Schema::hasColumn('outlet_sale_items', 'issue_type')) {
+                $table->string('issue_type', 20)
+                    ->default('retail')
+                    ->after('unit');
+            }
+
+            if (!Schema::hasColumn('outlet_sale_items', 'discount_amount')) {
+                $table->decimal('discount_amount', 14, 2)
+                    ->default(0)
+                    ->after('issue_type');
+            }
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('outlet_sale_items', function (Blueprint $table) {
+            if (Schema::hasColumn('outlet_sale_items', 'discount_amount')) {
+                $table->dropColumn('discount_amount');
+            }
+
+            if (Schema::hasColumn('outlet_sale_items', 'issue_type')) {
+                $table->dropColumn('issue_type');
+            }
+        });
+    }
+};
