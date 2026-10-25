@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, type FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import axios from 'axios';
 
@@ -12,18 +12,54 @@ type DashboardModule = {
   bgColor: string;
   path?: string;
   comingSoon?: boolean;
-  adminOnly?: boolean;
-  accessKeywords: string[];
 };
 
 export default function Dashboard() {
   const [token, setToken] = useState('');
-  const [userRoles, setUserRoles] = useState<string[]>([]);
-  const [userPermissions, setUserPermissions] = useState<string[]>([]);
-  const [isAdminUser, setIsAdminUser] = useState(false);
+  const [userName, setUserName] = useState('');
+  const [userEmail, setUserEmail] = useState('');
+  const [userRole, setUserRole] = useState('');
+  const [companyName, setCompanyName] = useState('ServiceOS');
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [isSuperAdminUser, setIsSuperAdminUser] = useState(false);
+  const [superAdminUnlocked, setSuperAdminUnlocked] = useState(false);
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [accessReady, setAccessReady] = useState(false);
+  const [showFixAuthModal, setShowFixAuthModal] = useState(false);
+  const [fixAuthEmail, setFixAuthEmail] = useState('');
+  const [fixAuthPassword, setFixAuthPassword] = useState('');
+  const [fixAuthError, setFixAuthError] = useState('');
+  const [fixAuthLoading, setFixAuthLoading] = useState(false);
+  const [fixAuthMode, setFixAuthMode] = useState<'unlock-edit' | 'fix-widgets' | 'edit-widgets'>('unlock-edit');
   const router = useRouter();
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
+  const canEditWidgets = canManageFeatureVisibility || isSuperAdminUser || superAdminUnlocked;
+  const showWidgetCloseButtons = canEditWidgets && !widgetsFixed;
+
+  useEffect(() => {
+    const stored = localStorage.getItem('widgets_fixed_global');
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === 'widgets_fixed_global') {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
 
   useEffect(() => {
     const storedToken = localStorage.getItem('token');
@@ -34,9 +70,107 @@ export default function Dashboard() {
     }
   }, [router]);
 
+  useEffect(() => {
+    if (!token) return;
+
+    const fetchCompanyName = async () => {
+      try {
+        const res = await axios.get(`${API_URL}/api/companies`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        const rows = Array.isArray(res.data) ? res.data : (res.data?.data || []);
+        const name = String(rows[0]?.name || '').trim();
+        if (name) {
+          setCompanyName(name);
+        }
+      } catch (error) {
+        console.error('Error fetching company name:', error);
+      }
+    };
+
+    fetchCompanyName();
+  }, [token, API_URL]);
+
   const handleLogout = () => {
     localStorage.removeItem('token');
     router.push('/');
+  };
+
+  const applyWidgetsFixed = (nextValue: boolean) => {
+    setWidgetsFixed(nextValue);
+    localStorage.setItem('widgets_fixed_global', nextValue ? '1' : '0');
+    window.dispatchEvent(new CustomEvent('widgets-fixed-changed', { detail: { fixed: nextValue } }));
+  };
+
+  const openFixAuthModal = (mode: 'unlock-edit' | 'fix-widgets' | 'edit-widgets') => {
+    setFixAuthMode(mode);
+    setFixAuthEmail('');
+    setFixAuthPassword('');
+    setFixAuthError('');
+    setShowFixAuthModal(true);
+  };
+
+  const closeFixAuthModal = () => {
+    if (fixAuthLoading) return;
+    setShowFixAuthModal(false);
+    setFixAuthEmail('');
+    setFixAuthPassword('');
+    setFixAuthError('');
+  };
+
+  const handleFixWidgetButtonClick = () => {
+    if (widgetsFixed && canEditWidgets) {
+      openFixAuthModal('edit-widgets');
+      return;
+    }
+
+    if (canEditWidgets) {
+      openFixAuthModal('fix-widgets');
+      return;
+    }
+
+    openFixAuthModal('unlock-edit');
+  };
+
+  const confirmFixWidgets = async (event: FormEvent) => {
+    event.preventDefault();
+
+    if (!token || fixAuthLoading) {
+      return;
+    }
+
+    try {
+      setFixAuthLoading(true);
+      setFixAuthError('');
+
+      await axios.post(
+        `${API_URL}/api/feature-visibility/verify-super-admin`,
+        {
+          email: fixAuthEmail.trim(),
+          password: fixAuthPassword,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      setSuperAdminUnlocked(true);
+      if (fixAuthMode === 'fix-widgets') {
+        applyWidgetsFixed(true);
+      } else {
+        applyWidgetsFixed(false);
+      }
+      setShowFixAuthModal(false);
+      setFixAuthEmail('');
+      setFixAuthPassword('');
+      setFixAuthError('');
+    } catch (error: any) {
+      const message = error?.response?.data?.message || 'Super Admin credentials are invalid.';
+      setFixAuthError(message);
+    } finally {
+      setFixAuthLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -59,38 +193,47 @@ export default function Dashboard() {
           .map((role) => role.trim().toLowerCase())
           .filter(Boolean);
 
-        const permissionNames = Array.isArray(userData?.roles)
-          ? userData.roles.flatMap((role: any) =>
-              Array.isArray(role?.permissions)
-                ? role.permissions.map((permission: any) =>
-                    String(permission?.name || '').trim().toLowerCase()
-                  )
-                : []
-            )
+        const roleBlob = roleNames.join(' ');
+        const superAdminUser = !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+
+        const visibilityRes = await axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+          ? visibilityRes.data.hidden_modules
+              .map((moduleId: unknown) => String(moduleId || '').trim())
+              .filter(Boolean)
           : [];
 
-        const roleBlob = roleNames.join(' ');
-        const adminUser =
-          !employeeId ||
-          roleBlob.includes('super admin') ||
-          roleBlob.includes('superadmin') ||
-          roleBlob.includes('administrator') ||
-          roleBlob.includes('admin');
+        const displayName = [String(userData?.first_name || ''), String(userData?.last_name || '')]
+          .map((part) => part.trim())
+          .filter(Boolean)
+          .join(' ')
+          || String(userData?.name || '').trim()
+          || String(userData?.username || '').trim()
+          || 'Logged User';
 
-        const isOutletUser = roleNames.some((role) => role.includes('outlet_user'));
-        if (!adminUser && isOutletUser) {
-          router.push('/outlet-pos');
-          return;
-        }
+        const displayEmail = String(userData?.email || '').trim();
+        const displayRole = String(userData?.role || '').trim()
+          || (Array.isArray(userData?.roles) && userData.roles.length > 0
+            ? String(userData.roles[0]?.name || '').trim()
+            : 'User');
 
-        setUserRoles(Array.from(new Set(roleNames)));
-        setUserPermissions(Array.from(new Set(permissionNames.filter(Boolean))));
-        setIsAdminUser(adminUser);
+        setCanManageFeatureVisibility(Boolean(visibilityRes.data?.can_manage));
+        setIsSuperAdminUser(superAdminUser);
+        setHiddenModules(Array.from(new Set(hiddenModuleList)));
+        setUserName(displayName);
+        setUserEmail(displayEmail);
+        setUserRole(displayRole);
       } catch (error) {
         console.error('Error fetching dashboard access profile:', error);
-        setUserRoles([]);
-        setUserPermissions([]);
-        setIsAdminUser(false);
+        setCanManageFeatureVisibility(false);
+        setIsSuperAdminUser(false);
+        setHiddenModules([]);
+        setUserName('');
+        setUserEmail('');
+        setUserRole('');
       } finally {
         setAccessReady(true);
       }
@@ -98,13 +241,6 @@ export default function Dashboard() {
 
     fetchUserAccess();
   }, [token, router]);
-
-  const hasModuleAccess = (keywords: string[]) => {
-    if (isAdminUser) return true;
-    if (keywords.length === 0) return false;
-
-    return userPermissions.some((permission) => keywords.some((keyword) => permission.includes(keyword)));
-  };
 
   const modules: DashboardModule[] = [
     {
@@ -114,7 +250,6 @@ export default function Dashboard() {
       color: 'from-red-500 to-pink-500',
       bgColor: 'from-red-50 to-pink-50',
       path: '/dashboard/hrm',
-      accessKeywords: ['hrm', 'employee', 'department', 'designation', 'attendance', 'leave', 'payroll', 'candidate', 'role', 'permission'],
     },
     {
       id: 'reports',
@@ -123,7 +258,6 @@ export default function Dashboard() {
       color: 'from-rose-500 to-red-500',
       bgColor: 'from-rose-50 to-red-50',
       path: '/dashboard/reports',
-      accessKeywords: ['report'],
     },
     {
       id: 'settings',
@@ -132,8 +266,6 @@ export default function Dashboard() {
       color: 'from-slate-500 to-gray-500',
       bgColor: 'from-slate-50 to-gray-50',
       path: '/dashboard/company-settings',
-      adminOnly: true,
-      accessKeywords: ['setting', 'config', 'user', 'permission', 'role'],
     },
     {
       id: 'purchasing',
@@ -142,7 +274,6 @@ export default function Dashboard() {
       color: 'from-cyan-500 to-blue-500',
       bgColor: 'from-cyan-50 to-blue-50',
       path: '/dashboard/purchasing',
-      accessKeywords: ['purchasing', 'purchesing', 'purchase', 'grn', 'supplier'],
     },
     {
       id: 'job-cards',
@@ -151,7 +282,6 @@ export default function Dashboard() {
       color: 'from-indigo-500 to-violet-500',
       bgColor: 'from-indigo-50 to-violet-50',
       path: '/dashboard/job-cards',
-      accessKeywords: ['job', 'jobcard', 'job_card', 'service', 'repair', 'technician'],
     },
     {
       id: 'invoicing',
@@ -160,7 +290,6 @@ export default function Dashboard() {
       color: 'from-teal-500 to-cyan-500',
       bgColor: 'from-teal-50 to-cyan-50',
       path: '/dashboard/invoicing',
-      accessKeywords: ['invoice', 'invoicing', 'quotation', 'billing', 'service'],
     },
     {
       id: 'stock',
@@ -169,7 +298,6 @@ export default function Dashboard() {
       color: 'from-orange-500 to-red-500',
       bgColor: 'from-orange-50 to-red-50',
       path: '/dashboard/stock',
-      accessKeywords: ['stock', 'inventory', 'supplier', 'transfer'],
     },
     {
       id: 'accounts',
@@ -178,21 +306,55 @@ export default function Dashboard() {
       color: 'from-emerald-500 to-cyan-500',
       bgColor: 'from-emerald-50 to-cyan-50',
       path: '/dashboard/accounts',
-      accessKeywords: ['account', 'accounts', 'ledger', 'cash', 'petty', 'finance'],
     },
   ];
 
+  const handleFeatureVisibilityToggle = async (moduleId: string, nextHiddenState: boolean) => {
+    if (!canEditWidgets) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleId,
+          hidden: nextHiddenState,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Unable to update feature visibility:', error);
+      alert('Unable to update feature visibility. Please try again.');
+    }
+  };
+
   const visibleModules = modules.filter((module) => {
-    if (module.adminOnly) return isAdminUser;
-    if (module.id === 'hrm') {
-      // Keep HRM entry visible so every employee can access leave requests.
-      return true;
-    }
-    if (module.id === 'job-cards' || module.id === 'invoicing') {
-      return true;
-    }
-    return hasModuleAccess(module.accessKeywords);
+    return !hiddenModules.includes(module.id);
   });
+
+  const settingsModules = [
+    { id: 'company-settings', icon: '🏢', title: 'Company Settings', desc: 'Manage company profile for invoices and documents', color: 'from-blue-500 to-cyan-500', path: '/dashboard/company-settings' },
+    { id: 'user-management', icon: '👥', title: 'User Management', desc: 'Manage users and permissions', color: 'from-green-500 to-emerald-500', path: '/dashboard/hrm/roles' },
+    { id: 'system-settings', icon: '⚙️', title: 'System Settings', desc: 'Configure system preferences', color: 'from-purple-500 to-indigo-500', path: '/dashboard/system-settings' },
+    { id: 'security-settings', icon: '🔒', title: 'Security Settings', desc: 'Manage security configurations', color: 'from-red-500 to-pink-500', path: '/dashboard/security-settings' },
+    { id: 'backup-restore', icon: '💾', title: 'Backup & Restore', desc: 'Manage data backups', color: 'from-teal-500 to-green-500', path: '/dashboard/backup-restore' },
+  ];
+
+  const visibleSettingsModules = settingsModules.filter((setting) => {
+    return !hiddenModules.includes(setting.id);
+  });
+
 
   const handleModuleClick = (module: DashboardModule) => {
     if (module.path) {
@@ -229,10 +391,10 @@ export default function Dashboard() {
             <div className="flex items-center justify-between sm:justify-start">
               <div className="flex-shrink-0 flex items-center space-x-3">
                 <div className="w-8 h-8 bg-gradient-to-r from-red-500 to-pink-500 rounded-lg flex items-center justify-center">
-                  <span className="text-white font-bold text-sm">BMS</span>
+                  <span className="text-white font-bold text-sm">SO</span>
                 </div>
                 <h1 className="text-gray-900 text-lg sm:text-xl font-bold bg-gradient-to-r from-red-600 to-pink-600 bg-clip-text text-transparent">
-                  Business Management System
+                  {companyName}
                 </h1>
               </div>
             </div>
@@ -241,6 +403,35 @@ export default function Dashboard() {
                 <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
                 <span>System Online</span>
               </div>
+              <div className="hidden lg:flex items-center gap-3 rounded-full border border-white/70 bg-white/70 px-3 py-1.5">
+                <div className="flex h-9 w-9 items-center justify-center rounded-full bg-gradient-to-r from-red-500 to-pink-500 text-xs font-bold text-white">
+                  {(userName || 'U').charAt(0).toUpperCase()}
+                </div>
+                <div className="min-w-0 text-left">
+                  <p className="max-w-[180px] truncate text-sm font-semibold text-gray-900">{userName || 'Logged User'}</p>
+                  <p className="max-w-[180px] truncate text-xs text-gray-500">{userEmail || userRole || 'User'}</p>
+                </div>
+                <span className="rounded-full bg-pink-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-pink-700">
+                  {userRole || 'User'}
+                </span>
+              </div>
+              {canEditWidgets ? (
+                <button
+                  onClick={handleFixWidgetButtonClick}
+                  className="bg-gradient-to-r from-slate-500 to-gray-600 hover:from-slate-600 hover:to-gray-700 text-white px-5 py-2 rounded-full text-sm font-semibold transition-all duration-300 transform hover:scale-105 shadow-lg hover:shadow-xl"
+                >
+                  {widgetsFixed ? 'Edit Widgets' : 'Fix Widgets'}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleFixWidgetButtonClick}
+                  className="bg-slate-200 hover:bg-slate-300 text-slate-700 px-5 py-2 rounded-full text-sm font-semibold transition-colors"
+                  title="Preview only. Super Admin access is required to edit widgets."
+                >
+                  Edit Widgets (Preview)
+                </button>
+              )}
               <button
                 onClick={handleLogout}
                 className="bg-gradient-to-r from-red-500 to-pink-500 hover:from-red-600 hover:to-pink-600 text-white px-6 py-2 rounded-full text-sm font-medium transition-all duration-300 transform hover:scale-105 shadow-lg hover:shadow-xl"
@@ -261,7 +452,7 @@ export default function Dashboard() {
             </div>
           </div>
           <h2 className="text-4xl md:text-5xl font-bold text-gray-900 mb-4">
-            Welcome to <span className="bg-gradient-to-r from-red-600 to-pink-600 bg-clip-text text-transparent">BMS</span>
+            Welcome to <span className="bg-gradient-to-r from-red-600 to-pink-600 bg-clip-text text-transparent">ServiceOS</span>
           </h2>
           <p className="text-lg sm:text-xl text-gray-600 max-w-3xl mx-auto leading-relaxed px-1">
             Transform your business operations with our comprehensive management suite.
@@ -289,6 +480,24 @@ export default function Dashboard() {
                 module.name === 'HRM (Human Resource Management)' ? 'ring-2 ring-red-500/50' : ''
               }`}
             >
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void handleFeatureVisibilityToggle(module.id, true);
+                  }}
+                  className="absolute top-3 right-3 z-20 flex h-8 w-8 items-center justify-center rounded-full bg-rose-100 text-rose-700 text-xs font-semibold shadow hover:bg-rose-200"
+                  title="Hide module"
+                  aria-label="Hide module"
+                >
+                  <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M18 6 6 18" />
+                    <path d="m6 6 12 12" />
+                  </svg>
+                </button>
+              )}
+
               {/* Gradient Background */}
               <div className={`absolute inset-0 bg-gradient-to-br ${module.bgColor} opacity-0 group-hover:opacity-100 transition-opacity duration-500`}></div>
 
@@ -336,13 +545,12 @@ export default function Dashboard() {
 
         {visibleModules.length === 0 && (
           <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800 mb-8">
-            No feature modules are currently assigned to your role. Contact an administrator to grant view permissions.
+            No feature modules are currently visible. Contact an administrator to enable module widgets.
           </div>
         )}
 
         {/* Settings & Configuration Section */}
-        {isAdminUser && (
-          <div className="bg-white/70 backdrop-blur-sm rounded-2xl shadow-xl border border-white/20 overflow-hidden">
+        <div className="bg-white/70 backdrop-blur-sm rounded-2xl shadow-xl border border-white/20 overflow-hidden">
             <div className="bg-gradient-to-r from-red-500 to-pink-500 p-6">
               <div className="flex items-center space-x-3">
                 <div className="w-12 h-12 bg-white/20 rounded-xl flex items-center justify-center text-2xl">
@@ -357,13 +565,8 @@ export default function Dashboard() {
 
             <div className="p-6">
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {[
-                  { icon: '🏢', title: 'Company Settings', desc: 'Manage company profile for invoices and documents', color: 'from-blue-500 to-cyan-500', path: '/dashboard/company-settings' },
-                  { icon: '👥', title: 'User Management', desc: 'Manage users and permissions', color: 'from-green-500 to-emerald-500', path: '/dashboard/hrm/roles' },
-                  { icon: '⚙️', title: 'System Settings', desc: 'Configure system preferences', color: 'from-purple-500 to-indigo-500', path: '/dashboard/system-settings' },
-                  { icon: '🔒', title: 'Security Settings', desc: 'Manage security configurations', color: 'from-red-500 to-pink-500', path: '/dashboard/security-settings' },
-                  { icon: '💾', title: 'Backup & Restore', desc: 'Manage data backups', color: 'from-teal-500 to-green-500', path: '/dashboard/backup-restore' },
-                ].map((setting, index) => (
+                {visibleSettingsModules.map((setting, index) => {
+                  return (
                   <div
                     key={index}
                     onClick={() => {
@@ -374,8 +577,26 @@ export default function Dashboard() {
 
                       
                     }}
-                    className="group bg-white/50 hover:bg-white/80 rounded-xl p-4 border border-white/30 hover:border-white/50 transition-all duration-300 cursor-pointer transform hover:scale-105"
+                    className="group relative bg-white/50 hover:bg-white/80 rounded-xl p-4 border border-white/30 hover:border-white/50 transition-all duration-300 cursor-pointer transform hover:scale-105"
                   >
+                    {showWidgetCloseButtons && (
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleFeatureVisibilityToggle(setting.id, true);
+                        }}
+                        className="absolute top-2 right-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                        title="Disable widget"
+                        aria-label="Disable widget"
+                      >
+                        <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M18 6 6 18" />
+                          <path d="m6 6 12 12" />
+                        </svg>
+                      </button>
+                    )}
+
                     <div className="flex items-center space-x-3">
                       <div className={`w-12 h-12 bg-gradient-to-r ${setting.color} rounded-lg flex items-center justify-center text-xl shadow-lg group-hover:scale-110 transition-transform duration-300`}>
                         {setting.icon}
@@ -395,12 +616,91 @@ export default function Dashboard() {
                       </div>
                     </div>
                   </div>
-                ))}
+                );})}
               </div>
             </div>
           </div>
-        )}
       </main>
+
+      {showFixAuthModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="w-full max-w-md rounded-2xl bg-white shadow-2xl border border-white/60 overflow-hidden">
+            <div className="bg-gradient-to-r from-slate-600 to-gray-700 px-6 py-4 text-white">
+              <h3 className="text-lg font-bold">Super Admin Verification</h3>
+              <p className="text-sm text-white/80">
+                {fixAuthMode === 'fix-widgets'
+                  ? 'Enter Super Admin credentials to fix widget layout.'
+                  : fixAuthMode === 'edit-widgets'
+                  ? 'Enter Super Admin credentials to enable widget editing mode.'
+                  : 'Enter Super Admin credentials to enable widget editing.'}
+              </p>
+            </div>
+
+            <form onSubmit={confirmFixWidgets} className="p-6 space-y-4">
+              <div>
+                <label htmlFor="fix-auth-email" className="block text-sm font-medium text-gray-700 mb-1">
+                  Email
+                </label>
+                <input
+                  id="fix-auth-email"
+                  type="email"
+                  value={fixAuthEmail}
+                  onChange={(event) => setFixAuthEmail(event.target.value)}
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-500"
+                  placeholder="superadmin@example.com"
+                  required
+                  autoFocus
+                />
+              </div>
+
+              <div>
+                <label htmlFor="fix-auth-password" className="block text-sm font-medium text-gray-700 mb-1">
+                  Password
+                </label>
+                <input
+                  id="fix-auth-password"
+                  type="password"
+                  value={fixAuthPassword}
+                  onChange={(event) => setFixAuthPassword(event.target.value)}
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-500"
+                  placeholder="Enter password"
+                  required
+                />
+              </div>
+
+              {fixAuthError && (
+                <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                  {fixAuthError}
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={closeFixAuthModal}
+                  disabled={fixAuthLoading}
+                  className="px-4 py-2 text-sm font-medium text-gray-600 hover:text-gray-800 disabled:opacity-60"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={fixAuthLoading}
+                  className="rounded-lg bg-gradient-to-r from-slate-600 to-gray-700 px-4 py-2 text-sm font-semibold text-white hover:from-slate-700 hover:to-gray-800 disabled:opacity-60"
+                >
+                  {fixAuthLoading
+                    ? 'Verifying...'
+                    : fixAuthMode === 'fix-widgets'
+                    ? 'Verify & Fix Widgets'
+                    : fixAuthMode === 'edit-widgets'
+                    ? 'Verify & Edit Widgets'
+                    : 'Verify & Enable'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

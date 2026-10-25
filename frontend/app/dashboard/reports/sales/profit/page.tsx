@@ -127,15 +127,9 @@ export default function SalesProfitReportPage() {
           roleBlob.includes('admin');
         const hasReportPermission = permissionNames.some((permission: string) => permission.includes('report'));
 
-        if (!isAdminUser && !hasReportPermission) {
-          router.push('/dashboard');
-          return;
-        }
-
         await loadData(token);
       } catch (error) {
         console.error('Error checking sales report access:', error);
-        router.push('/dashboard');
       } finally {
         setAccessReady(true);
       }

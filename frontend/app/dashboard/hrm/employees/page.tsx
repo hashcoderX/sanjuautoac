@@ -40,6 +40,13 @@ interface Employee {
   tax_relief_eligible?: boolean;
   apit_tax_amount?: number;
   apit_tax_rate?: number;
+  reporting_person_id?: number | null;
+  reporting_person?: {
+    id: number;
+    employee_code?: string;
+    first_name: string;
+    last_name: string;
+  } | null;
   status: 'active' | 'inactive';
   user?: { role?: string };
   department: { id: number; name: string };
@@ -137,8 +144,49 @@ const DEFAULT_LEAVE_TYPES: LeaveType[] = [
   { id: -10, name: 'Medical / Hospitalization Leave', code: 'medical_hospitalization', description: 'Medical / hospitalization leave', max_days_per_year: 30, requires_documentation: true, is_active: true },
 ];
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
+const FEATURE_LABELS: Record<string, { name: string; location: string }> = {
+  'hrm-employees': { name: 'Employees', location: 'Human Resources > Employees' },
+  'hrm-departments': { name: 'Departments', location: 'Human Resources > Departments' },
+  'hrm-designations': { name: 'Designations', location: 'Human Resources > Designations' },
+  'hrm-attendance': { name: 'Attendance', location: 'Human Resources > Attendance' },
+  'hrm-leaves': { name: 'Leaves', location: 'Human Resources > Leaves' },
+  'hrm-candidates': { name: 'Candidates', location: 'Human Resources > Candidates' },
+  'hrm-payroll': { name: 'Payroll', location: 'Human Resources > Payroll' },
+  'hrm-roles': { name: 'Roles', location: 'Human Resources > Roles' },
+};
+
+const humanizeFeatureKey = (moduleKey: string) =>
+  moduleKey
+    .replace(/[-_]+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+
+const getFeatureMeta = (moduleKey: string) => {
+  const normalizedKey = String(moduleKey || '').trim();
+  const known = FEATURE_LABELS[normalizedKey];
+  if (known) {
+    return known;
+  }
+
+  const hrmPrefix = normalizedKey.startsWith('hrm-') ? 'Human Resources > ' : 'Dashboard > ';
+  return {
+    name: humanizeFeatureKey(normalizedKey),
+    location: `${hrmPrefix}${humanizeFeatureKey(normalizedKey.replace(/^hrm-/, ''))}`,
+  };
+};
+
 export default function Employees() {
   const [token, setToken] = useState('');
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [showFixAuthModal, setShowFixAuthModal] = useState(false);
+  const [fixAuthEmail, setFixAuthEmail] = useState('');
+  const [fixAuthPassword, setFixAuthPassword] = useState('');
+  const [fixAuthError, setFixAuthError] = useState('');
+  const [fixAuthLoading, setFixAuthLoading] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
   const [designations, setDesignations] = useState<Designation[]>([]);
@@ -160,8 +208,23 @@ export default function Employees() {
   const [activeEmployee, setActiveEmployee] = useState<Employee | null>(null);
   const [profileEmployee, setProfileEmployee] = useState<EmployeeFull | null>(null);
   const [profileLoading, setProfileLoading] = useState(false);
+  const [profileHiddenModules, setProfileHiddenModules] = useState<string[]>([]);
+  const [profileVisibilityLoading, setProfileVisibilityLoading] = useState(false);
+  const [profileVisibilityError, setProfileVisibilityError] = useState('');
+  const [profileHasUserAccount, setProfileHasUserAccount] = useState(true);
+  const [unblockingModuleKey, setUnblockingModuleKey] = useState<string | null>(null);
   const router = useRouter();
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+
+  const applyWidgetsFixed = (nextValue: boolean) => {
+    setWidgetsFixed(nextValue);
+    localStorage.setItem(GLOBAL_WIDGET_FIX_KEY, nextValue ? '1' : '0');
+    window.dispatchEvent(new CustomEvent('widgets-fixed-changed', { detail: { fixed: nextValue } }));
+  };
+
+  const isColumnVisible = (key: string) => !hiddenModules.includes(key);
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
 
   // Form fields
   const [firstName, setFirstName] = useState('');
@@ -189,6 +252,7 @@ export default function Employees() {
   const [departmentId, setDepartmentId] = useState('');
   const [designationId, setDesignationId] = useState('');
   const [branchId, setBranchId] = useState('');
+  const [reportingPersonId, setReportingPersonId] = useState('');
   const [status, setStatus] = useState<'active' | 'inactive'>('active');
 
   // Documents state
@@ -380,11 +444,176 @@ export default function Employees() {
   };
 
   useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+
+    return (
+      !employeeId ||
+      roleBlob.includes('super admin') ||
+      roleBlob.includes('superadmin')
+    );
+  };
+
+  const openFixAuthModal = () => {
+    setFixAuthEmail('');
+    setFixAuthPassword('');
+    setFixAuthError('');
+    setShowFixAuthModal(true);
+  };
+
+  const closeFixAuthModal = () => {
+    if (fixAuthLoading) return;
+    setShowFixAuthModal(false);
+    setFixAuthEmail('');
+    setFixAuthPassword('');
+    setFixAuthError('');
+  };
+
+  const handleFixWidgetButtonClick = () => {
+    if (!canManageFeatureVisibility) {
+      return;
+    }
+
+    if (widgetsFixed) {
+      applyWidgetsFixed(false);
+      return;
+    }
+
+    openFixAuthModal();
+  };
+
+  const confirmFixWidgets = async (event: React.FormEvent) => {
+    event.preventDefault();
+
+    if (!token || !canManageFeatureVisibility || fixAuthLoading) {
+      return;
+    }
+
+    try {
+      setFixAuthLoading(true);
+      setFixAuthError('');
+
+      await axios.post(
+        `${API_URL}/api/feature-visibility/verify-super-admin`,
+        {
+          email: fixAuthEmail.trim(),
+          password: fixAuthPassword,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      applyWidgetsFixed(true);
+      setShowFixAuthModal(false);
+      setFixAuthEmail('');
+      setFixAuthPassword('');
+      setFixAuthError('');
+    } catch (error: any) {
+      const message = error?.response?.data?.message || 'Super Admin credentials are invalid.';
+      setFixAuthError(message);
+    } finally {
+      setFixAuthLoading(false);
+    }
+  };
+
+  const fetchAccessProfile = async (authToken: string) => {
+    try {
+      const [userRes, visibilityRes] = await Promise.all([
+        axios.get(`${API_URL}/api/user`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+      ]);
+
+      const superAdmin = isSuperAdminUser(userRes.data || {});
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching employee page visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleColumnVisibilityToggle = async (columnKey: string, nextHiddenState: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: columnKey,
+          hidden: nextHiddenState,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating employee column visibility:', error);
+      showNotice('Update Failed', 'Unable to update column visibility. Please try again.', 'error');
+    }
+  };
+
+  useEffect(() => {
     const storedToken = localStorage.getItem('token');
     if (!storedToken) {
       router.push('/');
     } else {
       setToken(storedToken);
+      fetchAccessProfile(storedToken);
       fetchEmployees(storedToken);
       fetchDepartments(storedToken);
       fetchDesignations(storedToken);
@@ -558,6 +787,7 @@ export default function Employees() {
     setDepartmentId('');
     setDesignationId('');
     setBranchId('');
+    setReportingPersonId('');
     setStatus('active');
     setEmployeeLeaveBalances([]);
     setSelectedLeaveType('');
@@ -600,6 +830,7 @@ export default function Employees() {
       designation_id: Number.isFinite(parsedDesignationId) && parsedDesignationId > 0 ? parsedDesignationId : undefined,
       designation_name: selectedDesignation?.name || undefined,
       branch_id: parseInt(branchId),
+      reporting_person_id: reportingPersonId ? parseInt(reportingPersonId) : undefined,
       status,
       leave_balances: employeeLeaveBalances.length > 0 ? employeeLeaveBalances : undefined,
     };
@@ -657,6 +888,7 @@ export default function Employees() {
     setDepartmentId(employee.department.id.toString());
     setDesignationId(employee.designation.id.toString());
     setBranchId(employee.branch.id.toString());
+    setReportingPersonId(employee.reporting_person_id ? employee.reporting_person_id.toString() : '');
     setStatus(employee.status);
     setShowForm(true);
   };
@@ -687,18 +919,74 @@ export default function Employees() {
   const openProfile = async (employee: Employee) => {
     try {
       setProfileLoading(true);
+      setProfileVisibilityLoading(false);
+      setProfileVisibilityError('');
+      setProfileHiddenModules([]);
+      setProfileHasUserAccount(true);
       setShowProfileModal(true);
       const response = await axios.get(`${API_URL}/api/hr/employees/${employee.id}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       setProfileEmployee(response.data as EmployeeFull);
       setActiveEmployee(employee);
+
+      if (canManageFeatureVisibility) {
+        setProfileVisibilityLoading(true);
+        try {
+          const visibilityRes = await axios.get(`${API_URL}/api/feature-visibility/employee/${employee.id}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+
+          const hiddenList = Array.isArray(visibilityRes.data?.hidden_modules)
+            ? visibilityRes.data.hidden_modules
+                .map((moduleId: unknown) => String(moduleId || '').trim())
+                .filter(Boolean)
+            : [];
+
+          setProfileHasUserAccount(Boolean(visibilityRes.data?.has_user_account));
+          setProfileHiddenModules(hiddenList);
+        } catch (visibilityError: any) {
+          setProfileVisibilityError(
+            visibilityError?.response?.data?.message || 'Failed to load employee hidden features.'
+          );
+        } finally {
+          setProfileVisibilityLoading(false);
+        }
+      }
     } catch (error) {
       console.error('Error loading employee profile:', error);
       showNotice('Error', 'Failed to load employee profile', 'error');
       setShowProfileModal(false);
     } finally {
       setProfileLoading(false);
+    }
+  };
+
+  const handleUnblockEmployeeFeature = async (employeeId: number, moduleKey: string) => {
+    if (!token || !canManageFeatureVisibility) return;
+
+    try {
+      setUnblockingModuleKey(moduleKey);
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility/employee/${employeeId}/unblock`,
+        { module_key: moduleKey },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const hiddenList = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setProfileHiddenModules(hiddenList);
+      showNotice('Success', `Unblocked ${moduleKey} for this employee.`, 'success');
+    } catch (error: any) {
+      showNotice('Error', error?.response?.data?.message || 'Failed to unblock this feature.', 'error');
+    } finally {
+      setUnblockingModuleKey(null);
     }
   };
 
@@ -1093,7 +1381,22 @@ export default function Employees() {
         {/* Hero Section */}
         <div className="mb-8 flex flex-col md:flex-row md:items-start md:justify-between gap-6 md:gap-8">
           <div>
-            <div className="flex items-center space-x-3 mb-4">
+            {isElementVisible('hrm-employees-el-title') && (
+            <div className="relative flex items-center space-x-3 mb-4">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleColumnVisibilityToggle('hrm-employees-el-title', true); }}
+                  className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                  title="Hide section"
+                  aria-label="Hide title section"
+                >
+                  <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M18 6 6 18" />
+                    <path d="m6 6 12 12" />
+                  </svg>
+                </button>
+              )}
               <div className="w-12 h-12 bg-gradient-to-r from-blue-500 to-cyan-500 rounded-xl flex items-center justify-center text-2xl shadow-lg">
                 👥
               </div>
@@ -1102,22 +1405,86 @@ export default function Employees() {
                 <p className="text-sm sm:text-base md:text-lg text-gray-600">Manage your workforce efficiently with comprehensive employee tools</p>
               </div>
             </div>
+            )}
             <div className="flex flex-col sm:flex-row gap-4 sm:space-x-6 sm:gap-0 mt-2 sm:mt-4">
-              <div className="text-center">
+              {isElementVisible('hrm-employees-el-stat-total') && (
+              <div className="relative text-center">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handleColumnVisibilityToggle('hrm-employees-el-stat-total', true); }}
+                    className="absolute -top-2 -right-4 z-20 flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide Total Employees"
+                    aria-label="Hide Total Employees"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
                 <div className="text-xl sm:text-2xl font-bold text-blue-600">{employees.length}</div>
                 <div className="text-sm text-gray-500">Total Employees</div>
               </div>
-              <div className="text-center">
+              )}
+              {isElementVisible('hrm-employees-el-stat-active') && (
+              <div className="relative text-center">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handleColumnVisibilityToggle('hrm-employees-el-stat-active', true); }}
+                    className="absolute -top-2 -right-4 z-20 flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide Active Employees"
+                    aria-label="Hide Active Employees"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
                 <div className="text-xl sm:text-2xl font-bold text-green-600">{employees.filter(e => e.status === 'active').length}</div>
                 <div className="text-sm text-gray-500">Active Employees</div>
               </div>
-              <div className="text-center">
+              )}
+              {isElementVisible('hrm-employees-el-stat-departments') && (
+              <div className="relative text-center">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handleColumnVisibilityToggle('hrm-employees-el-stat-departments', true); }}
+                    className="absolute -top-2 -right-4 z-20 flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide Departments"
+                    aria-label="Hide Departments"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
                 <div className="text-xl sm:text-2xl font-bold text-purple-600">{departments.length}</div>
                 <div className="text-sm text-gray-500">Departments</div>
               </div>
+              )}
             </div>
           </div>
-          <div className="md:flex-shrink-0">
+          {isElementVisible('hrm-employees-el-btn-add') && (
+          <div className="relative md:flex-shrink-0">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleColumnVisibilityToggle('hrm-employees-el-btn-add', true); }}
+                className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                title="Hide Add Employee button"
+                aria-label="Hide Add Employee button"
+              >
+                <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M18 6 6 18" />
+                  <path d="m6 6 12 12" />
+                </svg>
+              </button>
+            )}
             <button
               onClick={() => {
                 resetForm();
@@ -1131,6 +1498,7 @@ export default function Employees() {
               <span>Add Employee</span>
             </button>
           </div>
+          )}
         </div>
 
         {/* Employee List */}
@@ -1149,72 +1517,182 @@ export default function Employees() {
 
           <div className="px-6 py-4 border-b border-gray-200 bg-white/70">
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-6 gap-3">
-              <input
-                type="text"
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                placeholder="Search employee, code, email..."
-                className="xl:col-span-2 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 placeholder-gray-400 focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500"
-              />
+              {isElementVisible('hrm-employees-el-filter-search') && (
+                <div className="relative xl:col-span-2">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleColumnVisibilityToggle('hrm-employees-el-filter-search', true); }}
+                      className="absolute -top-2 -right-2 z-20 flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide Search"
+                      aria-label="Hide Search"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  <input
+                    type="text"
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                    placeholder="Search employee, code, email..."
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 placeholder-gray-400 focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500"
+                  />
+                </div>
+              )}
 
-              <select
-                value={statusFilter}
-                onChange={(e) => setStatusFilter(e.target.value)}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500"
-              >
-                <option value="all">All Status</option>
-                <option value="active">Active</option>
-                <option value="inactive">Inactive</option>
-              </select>
+              {isElementVisible('hrm-employees-el-filter-status') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleColumnVisibilityToggle('hrm-employees-el-filter-status', true); }}
+                      className="absolute -top-2 -right-2 z-20 flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide Status Filter"
+                      aria-label="Hide Status Filter"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  <select
+                    value={statusFilter}
+                    onChange={(e) => setStatusFilter(e.target.value)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500"
+                  >
+                    <option value="all">All Status</option>
+                    <option value="active">Active</option>
+                    <option value="inactive">Inactive</option>
+                  </select>
+                </div>
+              )}
 
-              <select
-                value={departmentFilter}
-                onChange={(e) => setDepartmentFilter(e.target.value)}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500"
-              >
-                <option value="all">All Departments</option>
-                {departments.map((department) => (
-                  <option key={department.id} value={department.id}>{department.name}</option>
-                ))}
-              </select>
+              {isElementVisible('hrm-employees-el-filter-department') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleColumnVisibilityToggle('hrm-employees-el-filter-department', true); }}
+                      className="absolute -top-2 -right-2 z-20 flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide Department Filter"
+                      aria-label="Hide Department Filter"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  <select
+                    value={departmentFilter}
+                    onChange={(e) => setDepartmentFilter(e.target.value)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500"
+                  >
+                    <option value="all">All Departments</option>
+                    {departments.map((department) => (
+                      <option key={department.id} value={department.id}>{department.name}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
 
-              <select
-                value={designationFilter}
-                onChange={(e) => setDesignationFilter(e.target.value)}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500"
-              >
-                <option value="all">All Designations</option>
-                {Array.from(new Map(employees.map((employee) => [employee.designation.id, employee.designation])).values()).map((designation) => (
-                  <option key={designation.id} value={designation.id}>{designation.name}</option>
-                ))}
-              </select>
+              {isElementVisible('hrm-employees-el-filter-designation') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleColumnVisibilityToggle('hrm-employees-el-filter-designation', true); }}
+                      className="absolute -top-2 -right-2 z-20 flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide Designation Filter"
+                      aria-label="Hide Designation Filter"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  <select
+                    value={designationFilter}
+                    onChange={(e) => setDesignationFilter(e.target.value)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500"
+                  >
+                    <option value="all">All Designations</option>
+                    {Array.from(new Map(employees.map((employee) => [employee.designation.id, employee.designation])).values()).map((designation) => (
+                      <option key={designation.id} value={designation.id}>{designation.name}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
 
-              <div className="flex gap-2">
-                <select
-                  value={branchFilter}
-                  onChange={(e) => setBranchFilter(e.target.value)}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500"
-                >
-                  <option value="all">All Branches</option>
-                  {branches.map((branch) => (
-                    <option key={branch.id} value={branch.id}>{branch.name}</option>
-                  ))}
-                </select>
+              {(isElementVisible('hrm-employees-el-filter-branch') || isElementVisible('hrm-employees-el-btn-reset')) && (
+                <div className="flex gap-2">
+                  {isElementVisible('hrm-employees-el-filter-branch') && (
+                    <div className="relative w-full">
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleColumnVisibilityToggle('hrm-employees-el-filter-branch', true); }}
+                          className="absolute -top-2 -right-2 z-20 flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Branch Filter"
+                          aria-label="Hide Branch Filter"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                      <select
+                        value={branchFilter}
+                        onChange={(e) => setBranchFilter(e.target.value)}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-900 focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500"
+                      >
+                        <option value="all">All Branches</option>
+                        {branches.map((branch) => (
+                          <option key={branch.id} value={branch.id}>{branch.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
 
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSearchTerm('');
-                    setStatusFilter('all');
-                    setDepartmentFilter('all');
-                    setDesignationFilter('all');
-                    setBranchFilter('all');
-                  }}
-                  className="px-3 py-2 rounded-lg border border-gray-300 text-sm text-gray-700 hover:bg-gray-100 whitespace-nowrap"
-                >
-                  Reset
-                </button>
-              </div>
+                  {isElementVisible('hrm-employees-el-btn-reset') && (
+                    <div className="relative">
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleColumnVisibilityToggle('hrm-employees-el-btn-reset', true); }}
+                          className="absolute -top-2 -right-2 z-20 flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Reset Button"
+                          aria-label="Hide Reset Button"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSearchTerm('');
+                          setStatusFilter('all');
+                          setDepartmentFilter('all');
+                          setDesignationFilter('all');
+                          setBranchFilter('all');
+                        }}
+                        className="px-3 py-2 rounded-lg border border-gray-300 text-sm text-gray-700 hover:bg-gray-100 whitespace-nowrap"
+                      >
+                        Reset
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
 
@@ -1222,63 +1700,222 @@ export default function Employees() {
             <table className="min-w-full divide-y divide-gray-200">
               <thead className="bg-gray-50">
                 <tr>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Employee Code
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Name
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Email
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Department
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Designation
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Branch
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Status
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Actions
-                  </th>
+                  {isColumnVisible('hrm-employees-col-code') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center justify-between gap-2">
+                        <span>Employee Code</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleColumnVisibilityToggle('hrm-employees-col-code', true); }}
+                            className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide column"
+                            aria-label="Hide Employee Code column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-employees-col-name') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center justify-between gap-2">
+                        <span>Name</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleColumnVisibilityToggle('hrm-employees-col-name', true); }}
+                            className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide column"
+                            aria-label="Hide Name column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-employees-col-email') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center justify-between gap-2">
+                        <span>Email</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleColumnVisibilityToggle('hrm-employees-col-email', true); }}
+                            className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide column"
+                            aria-label="Hide Email column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-employees-col-department') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center justify-between gap-2">
+                        <span>Department</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleColumnVisibilityToggle('hrm-employees-col-department', true); }}
+                            className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide column"
+                            aria-label="Hide Department column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-employees-col-designation') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center justify-between gap-2">
+                        <span>Designation</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleColumnVisibilityToggle('hrm-employees-col-designation', true); }}
+                            className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide column"
+                            aria-label="Hide Designation column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-employees-col-branch') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center justify-between gap-2">
+                        <span>Branch</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleColumnVisibilityToggle('hrm-employees-col-branch', true); }}
+                            className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide column"
+                            aria-label="Hide Branch column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-employees-col-status') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center justify-between gap-2">
+                        <span>Status</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleColumnVisibilityToggle('hrm-employees-col-status', true); }}
+                            className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide column"
+                            aria-label="Hide Status column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-employees-col-actions') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center justify-between gap-2">
+                        <span>Actions</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleColumnVisibilityToggle('hrm-employees-col-actions', true); }}
+                            className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide column"
+                            aria-label="Hide Actions column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
                 {paginatedEmployees.map((employee) => (
                   <tr key={employee.id} className="hover:bg-gray-50 transition-colors duration-200">
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-semibold text-gray-900">
-                      {employee.employee_code}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      {employee.first_name} {employee.last_name}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      {employee.email}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      {employee.department.name}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      {employee.designation.name}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      {employee.branch.name}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <span className={`inline-flex px-3 py-1 text-xs font-semibold rounded-full ${
-                        employee.status === 'active'
-                          ? 'bg-green-100 text-green-800'
-                          : 'bg-red-100 text-red-800'
-                      }`}>
-                        {employee.status}
-                      </span>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium relative z-20">
+                    {isColumnVisible('hrm-employees-col-code') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm font-semibold text-gray-900">
+                        {employee.employee_code}
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-employees-col-name') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        {employee.first_name} {employee.last_name}
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-employees-col-email') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        {employee.email}
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-employees-col-department') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        {employee.department.name}
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-employees-col-designation') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        {employee.designation.name}
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-employees-col-branch') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        {employee.branch.name}
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-employees-col-status') && (
+                      <td className="px-6 py-4 whitespace-nowrap">
+                        <span className={`inline-flex px-3 py-1 text-xs font-semibold rounded-full ${
+                          employee.status === 'active'
+                            ? 'bg-green-100 text-green-800'
+                            : 'bg-red-100 text-red-800'
+                        }`}>
+                          {employee.status}
+                        </span>
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-employees-col-actions') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium relative z-20">
                       <div className="relative" ref={openMenuFor === employee.id ? menuRef : undefined}>
                         <button
                           aria-haspopup="menu"
@@ -1361,7 +1998,8 @@ export default function Employees() {
                           </div>
                         )}
                       </div>
-                    </td>
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
@@ -1857,6 +2495,26 @@ export default function Employees() {
 
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Reporting Person
+                  </label>
+                  <select
+                    value={reportingPersonId}
+                    onChange={(e) => setReportingPersonId(e.target.value)}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 text-gray-900"
+                  >
+                    <option value="">Select Reporting Person (Optional)</option>
+                    {employees
+                      .filter((emp) => !editingEmployee || emp.id !== editingEmployee.id)
+                      .map((emp) => (
+                        <option key={emp.id} value={emp.id}>
+                          {emp.employee_code} - {emp.first_name} {emp.last_name}
+                        </option>
+                      ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
                     Status
                   </label>
                   <select
@@ -2064,6 +2722,7 @@ export default function Employees() {
                     <div><strong>Department:</strong> {profileEmployee.department.name}</div>
                     <div><strong>Designation:</strong> {profileEmployee.designation.name}</div>
                     <div><strong>Branch:</strong> {profileEmployee.branch.name}</div>
+                    <div><strong>Reporting Person:</strong> {profileEmployee.reporting_person ? `${profileEmployee.reporting_person.first_name} ${profileEmployee.reporting_person.last_name}${profileEmployee.reporting_person.employee_code ? ` (${profileEmployee.reporting_person.employee_code})` : ''}` : 'N/A'}</div>
                     <div><strong>Status:</strong> 
                       <span className={`ml-2 px-2 py-1 text-xs rounded-full ${profileEmployee.status === 'active' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
                         {profileEmployee.status}
@@ -2152,6 +2811,63 @@ export default function Employees() {
                         </div>
                       ))}
                     </div>
+                  </div>
+                )}
+
+                {canManageFeatureVisibility && (
+                  <div className="bg-amber-50 rounded-xl p-6 border border-amber-200">
+                    <h4 className="text-lg font-semibold text-gray-900 mb-3">Employee Hidden Features</h4>
+                    <p className="text-sm text-amber-800 mb-4">
+                      Super Admin only: unblock hidden widgets/features for this employee account.
+                    </p>
+
+                    {profileVisibilityLoading ? (
+                      <div className="flex items-center gap-2 text-sm text-amber-800">
+                        <div className="h-4 w-4 animate-spin rounded-full border-2 border-amber-300 border-t-amber-700"></div>
+                        Loading hidden features...
+                      </div>
+                    ) : profileVisibilityError ? (
+                      <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                        {profileVisibilityError}
+                      </div>
+                    ) : !profileHasUserAccount ? (
+                      <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700">
+                        This employee has no linked system user account.
+                      </div>
+                    ) : profileHiddenModules.length === 0 ? (
+                      <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
+                        No hidden features for this employee.
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {profileHiddenModules.map((moduleKey) => {
+                          const featureMeta = getFeatureMeta(moduleKey);
+
+                          return (
+                          <div
+                            key={moduleKey}
+                            className="flex flex-col gap-2 rounded-lg border border-amber-200 bg-white px-3 py-2 sm:flex-row sm:items-center sm:justify-between"
+                          >
+                            <div className="space-y-0.5">
+                              <div className="text-sm font-semibold text-slate-900 break-all">{featureMeta.name}</div>
+                              <div className="text-xs text-slate-600 break-all">Location: {featureMeta.location}</div>
+                              <div className="text-xs text-slate-500 break-all">Feature Key: {moduleKey}</div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void handleUnblockEmployeeFeature(profileEmployee.id, moduleKey);
+                              }}
+                              disabled={unblockingModuleKey === moduleKey}
+                              className="inline-flex items-center justify-center rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-60"
+                            >
+                              {unblockingModuleKey === moduleKey ? 'Unblocking...' : 'Unblock'}
+                            </button>
+                          </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -2833,6 +3549,58 @@ export default function Employees() {
                 Confirm
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {showFixAuthModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={closeFixAuthModal} />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
+            <div className="flex items-start justify-between mb-4">
+              <h3 className="text-lg font-bold text-gray-900">Verify Super Admin</h3>
+              <button onClick={closeFixAuthModal} className="text-gray-500 hover:text-gray-700">✕</button>
+            </div>
+            <form onSubmit={confirmFixWidgets} className="space-y-4">
+              <p className="text-sm text-gray-600">Enter Super Admin credentials to enable Fix Widgets mode.</p>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Super Admin Email</label>
+                <input
+                  type="email"
+                  value={fixAuthEmail}
+                  onChange={(e) => setFixAuthEmail(e.target.value)}
+                  required
+                  className="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-slate-500 focus:border-slate-500 text-gray-900"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Super Admin Password</label>
+                <input
+                  type="password"
+                  value={fixAuthPassword}
+                  onChange={(e) => setFixAuthPassword(e.target.value)}
+                  required
+                  className="w-full px-4 py-2.5 border border-gray-300 rounded-xl focus:ring-2 focus:ring-slate-500 focus:border-slate-500 text-gray-900"
+                />
+              </div>
+              {fixAuthError && <p className="text-sm text-red-600">{fixAuthError}</p>}
+              <div className="flex justify-end space-x-3 pt-1">
+                <button
+                  type="button"
+                  onClick={closeFixAuthModal}
+                  className="px-5 py-2 rounded-xl bg-gray-200 text-gray-800 hover:bg-gray-300 transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={fixAuthLoading}
+                  className="px-5 py-2 rounded-xl bg-slate-600 text-white hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
+                >
+                  {fixAuthLoading ? 'Verifying...' : 'Verify & Fix'}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

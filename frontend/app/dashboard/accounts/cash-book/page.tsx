@@ -36,7 +36,16 @@ type JournalEntry = {
   id: string;
   date: string;
   posted_at?: string;
-  entry_type?: 'transfer' | 'withdrawal';
+  transaction_type?: 'in' | 'out';
+  entry_type?:
+    | 'transfer'
+    | 'withdrawal'
+    | 'invoice_payment'
+    | 'grn_payment'
+    | 'credit_payment'
+    | 'petty_cash'
+    | 'cash_in'
+    | 'cash_out';
   status?: 'pending' | 'accepted' | 'completed';
   company_name: string;
   source_account: string;
@@ -66,9 +75,23 @@ type MainJournalRow = JournalEntry & {
   row_source?: 'main' | 'outlet_request';
 };
 
+type CashDirection = 'cash_in' | 'cash_out';
+
 type JournalUiRow = MainJournalRow & {
-  txMark: 'Transfer In' | 'Transfer Out' | 'Pending Receipt' | 'Withdrawal' | 'Transfer' | 'Cheque Deposit' | 'Cheque Return';
+  txMark:
+    | 'Transfer In'
+    | 'Transfer Out'
+    | 'Pending Receipt'
+    | 'Withdrawal'
+    | 'Transfer'
+    | 'Cheque Deposit'
+    | 'Cheque Return'
+    | 'Invoice Payment'
+    | 'GRN Payment'
+    | 'Credit Payment';
   accountMark: 'Cash' | 'Bank' | 'Cheque' | 'Mixed';
+  cashDirection: CashDirection;
+  cashDirectionLabel: 'Cash In' | 'Cash Out';
   runningBalance: number;
   balanceLabel: string;
   displayDebitAccount: string;
@@ -128,6 +151,7 @@ export default function CashBookPage() {
   const [journalFilters, setJournalFilters] = useState({
     entryType: 'all',
     txMark: 'all',
+    cashDirection: 'all',
     accountMark: 'all',
     status: 'all',
     fromDate: '',
@@ -138,12 +162,37 @@ export default function CashBookPage() {
   const router = useRouter();
   const api = useMemo(() => createApiClient(token), [token]);
 
-  const detectEntryType = (reference?: string | null, note?: string | null): 'transfer' | 'withdrawal' | null => {
+  const detectEntryType = (
+    reference?: string | null,
+    note?: string | null,
+    rowType?: 'in' | 'out'
+  ): JournalEntry['entry_type'] => {
     const ref = String(reference || '').toLowerCase();
     const narration = String(note || '').toLowerCase();
 
     if (ref.startsWith('chq-')) {
-      return ref.startsWith('chq-ret-') ? 'withdrawal' : 'transfer';
+      return ref.startsWith('chq-ret-') ? 'cash_out' : 'cash_in';
+    }
+
+    if (narration.includes('grn payment')) {
+      return 'grn_payment';
+    }
+
+    if (
+      narration.includes('credit payment') ||
+      narration.includes('credit settlement') ||
+      narration.includes('customer credit') ||
+      narration.includes('supplier credit')
+    ) {
+      return 'credit_payment';
+    }
+
+    if (
+      narration.includes('job card invoice payment') ||
+      narration.includes('service invoice payment') ||
+      narration.includes('invoice payment')
+    ) {
+      return 'invoice_payment';
     }
 
     if (ref.startsWith('trf-') || narration.includes('transfer')) {
@@ -154,7 +203,7 @@ export default function CashBookPage() {
       return 'withdrawal';
     }
 
-    return null;
+    return rowType === 'in' ? 'cash_in' : 'cash_out';
   };
 
   const extractDebitCredit = (note: string | null | undefined, fallbackType: 'in' | 'out') => {
@@ -182,8 +231,7 @@ export default function CashBookPage() {
   };
 
   const mapTransactionToJournal = (row: MainCashTransactionRow): JournalEntry | null => {
-    const entryType = detectEntryType(row.reference, row.note);
-    if (!entryType) return null;
+    const entryType = detectEntryType(row.reference, row.note, row.type);
 
     const amount = Number(row.amount || 0);
     const { debit, credit } = extractDebitCredit(row.note, row.type);
@@ -192,6 +240,7 @@ export default function CashBookPage() {
       id: `main-tx-${row.id}`,
       date: row.date,
       posted_at: String(row.created_at || row.date || ''),
+      transaction_type: row.type,
       entry_type: entryType,
       status: 'completed',
       company_name: 'Main Account',
@@ -217,6 +266,18 @@ export default function CashBookPage() {
 
     if (entry.entry_type === 'withdrawal') {
       return 'Withdrawal';
+    }
+
+    if (entry.entry_type === 'invoice_payment') {
+      return 'Invoice Payment';
+    }
+
+    if (entry.entry_type === 'grn_payment') {
+      return 'GRN Payment';
+    }
+
+    if (entry.entry_type === 'credit_payment') {
+      return 'Credit Payment';
     }
 
     if (reference.startsWith('chq-ret-') || narration.includes('cheque return')) {
@@ -302,6 +363,32 @@ export default function CashBookPage() {
       .toLowerCase();
 
     return text.includes('cash');
+  };
+
+  const getCashDirection = (entry: MainJournalRow): CashDirection => {
+    const mark = getTxMark(entry);
+
+    if (entry.status === 'pending') {
+      return 'cash_in';
+    }
+
+    if (mark === 'Transfer In' || mark === 'Cheque Deposit' || mark === 'Pending Receipt' || mark === 'Transfer') {
+      return 'cash_in';
+    }
+
+    if (mark === 'Transfer Out' || mark === 'Withdrawal' || mark === 'Cheque Return') {
+      return 'cash_out';
+    }
+
+    if (mark === 'Invoice Payment' || mark === 'GRN Payment' || mark === 'Credit Payment') {
+      return entry.transaction_type === 'in' ? 'cash_in' : 'cash_out';
+    }
+
+    if (entry.transaction_type) {
+      return entry.transaction_type === 'in' ? 'cash_in' : 'cash_out';
+    }
+
+    return Number(entry.amount || 0) >= 0 ? 'cash_in' : 'cash_out';
   };
 
   useEffect(() => {
@@ -439,6 +526,8 @@ export default function CashBookPage() {
         ...entry,
         txMark,
         accountMark: getAccountMark(entry),
+        cashDirection: getCashDirection(entry),
+        cashDirectionLabel: getCashDirection(entry) === 'cash_in' ? 'Cash In' : 'Cash Out',
         runningBalance: currentBalance,
         balanceLabel: 'Main Cash',
         displayDebitAccount: shouldFlipTransferSides ? defaultCreditAccount : defaultDebitAccount,
@@ -457,9 +546,22 @@ export default function CashBookPage() {
       }
 
       if (entry.status !== 'pending' && affectsMainCash(entry)) {
-        if (mapped.txMark === 'Transfer In' || mapped.txMark === 'Cheque Deposit') {
+        if (
+          mapped.txMark === 'Transfer In' ||
+          mapped.txMark === 'Cheque Deposit' ||
+          (mapped.txMark === 'Invoice Payment' && entry.transaction_type === 'in') ||
+          (mapped.txMark === 'GRN Payment' && entry.transaction_type === 'in') ||
+          (mapped.txMark === 'Credit Payment' && entry.transaction_type === 'in')
+        ) {
           currentBalance -= amount;
-        } else if (mapped.txMark === 'Transfer Out' || mapped.txMark === 'Withdrawal' || mapped.txMark === 'Cheque Return') {
+        } else if (
+          mapped.txMark === 'Transfer Out' ||
+          mapped.txMark === 'Withdrawal' ||
+          mapped.txMark === 'Cheque Return' ||
+          (mapped.txMark === 'Invoice Payment' && entry.transaction_type === 'out') ||
+          (mapped.txMark === 'GRN Payment' && entry.transaction_type === 'out') ||
+          (mapped.txMark === 'Credit Payment' && entry.transaction_type === 'out')
+        ) {
           currentBalance += amount;
         }
       }
@@ -498,11 +600,14 @@ export default function CashBookPage() {
       if (journalFilters.entryType !== 'all' && entryType !== journalFilters.entryType) return false;
       if (journalFilters.txMark !== 'all' && entry.txMark !== journalFilters.txMark) return false;
 
+      if (journalFilters.cashDirection !== 'all' && entry.cashDirection !== journalFilters.cashDirection) {
+        return false;
+      }
+
       if (journalFilters.accountMark !== 'all') {
-        if (journalFilters.accountMark === 'Bank' && !accountText.includes('bank')) return false;
-        if (journalFilters.accountMark === 'Cash' && !accountText.includes('cash')) return false;
-        if (journalFilters.accountMark === 'Cheque' && !(accountText.includes('cheque') || accountText.includes('check'))) return false;
-        if (journalFilters.accountMark === 'Mixed' && entry.accountMark !== 'Mixed') return false;
+        if (journalFilters.accountMark === 'bank' && !accountText.includes('bank')) return false;
+        if (journalFilters.accountMark === 'cash' && !accountText.includes('cash')) return false;
+        if (journalFilters.accountMark === 'cheque' && !(accountText.includes('cheque') || accountText.includes('check'))) return false;
       }
 
       if (journalFilters.status !== 'all' && entryStatus !== journalFilters.status) return false;
@@ -535,6 +640,48 @@ export default function CashBookPage() {
       return true;
     });
   }, [journalRows, journalFilters]);
+
+  const directionSummary = useMemo(() => {
+    const cashIn = filteredJournalRows.reduce(
+      (sum, entry) => (entry.cashDirection === 'cash_in' ? sum + Number(entry.amount || 0) : sum),
+      0
+    );
+    const cashOut = filteredJournalRows.reduce(
+      (sum, entry) => (entry.cashDirection === 'cash_out' ? sum + Number(entry.amount || 0) : sum),
+      0
+    );
+
+    return {
+      cashIn,
+      cashOut,
+      net: cashIn - cashOut,
+    };
+  }, [filteredJournalRows]);
+
+  const paymentPreview = useMemo(() => {
+    const base = {
+      invoice: { count: 0, amount: 0 },
+      grn: { count: 0, amount: 0 },
+      credit: { count: 0, amount: 0 },
+    };
+
+    return filteredJournalRows.reduce((acc, entry) => {
+      const amount = Number(entry.amount || 0);
+      if (entry.entry_type === 'invoice_payment') {
+        acc.invoice.count += 1;
+        acc.invoice.amount += amount;
+      }
+      if (entry.entry_type === 'grn_payment') {
+        acc.grn.count += 1;
+        acc.grn.amount += amount;
+      }
+      if (entry.entry_type === 'credit_payment') {
+        acc.credit.count += 1;
+        acc.credit.amount += amount;
+      }
+      return acc;
+    }, base);
+  }, [filteredJournalRows]);
 
   const totalJournalPages = useMemo(
     () => Math.max(1, Math.ceil(filteredJournalRows.length / JOURNAL_PAGE_SIZE)),
@@ -572,44 +719,84 @@ export default function CashBookPage() {
 
   return (
     <div className="relative min-h-screen overflow-hidden bg-[radial-gradient(circle_at_top_left,_rgba(14,165,233,0.2),_transparent_24%),radial-gradient(circle_at_top_right,_rgba(16,185,129,0.16),_transparent_30%),linear-gradient(180deg,_#f0f9ff_0%,_#ecfeff_48%,_#f0fdfa_100%)]">
-      <nav className="relative z-10 bg-white/75 backdrop-blur-xl shadow-lg border-b border-white/30">
+      <div className="pointer-events-none absolute inset-0 opacity-35">
+        <div className="absolute left-14 top-20 h-72 w-72 rounded-full bg-cyan-200 blur-3xl"></div>
+        <div className="absolute right-8 top-36 h-80 w-80 rounded-full bg-emerald-200 blur-3xl"></div>
+        <div className="absolute bottom-6 left-1/3 h-64 w-64 rounded-full bg-amber-100 blur-3xl"></div>
+      </div>
+
+      <nav className="relative z-10 border-b border-white/60 bg-white/80 backdrop-blur-xl shadow-[0_18px_50px_-30px_rgba(8,47,73,0.45)]">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex flex-col sm:flex-row justify-between sm:items-center h-auto sm:h-16 py-3 gap-3">
-            <Link href="/dashboard/accounts" className="flex items-center space-x-2 text-gray-700 hover:text-sky-600">
-              <span>←</span>
-              <span className="font-medium text-sm sm:text-base">Back to Accounts</span>
+            <Link href="/dashboard/accounts" className="inline-flex items-center gap-2 text-gray-800 hover:text-sky-700">
+              <span className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-sky-200 bg-sky-50">←</span>
+              <span className="font-semibold text-sm sm:text-base">Back to Accounts</span>
             </Link>
-            <div className="flex items-center space-x-2 text-sm text-gray-600">
-              <div className="w-2 h-2 bg-sky-500 rounded-full animate-pulse"></div>
-              <span>Cash Book Journal</span>
+            <div className="inline-flex items-center gap-2 rounded-full border border-cyan-200 bg-cyan-50 px-3 py-1.5 text-sm font-semibold text-cyan-800">
+              <span className="h-2 w-2 rounded-full bg-cyan-500 animate-pulse"></span>
+              Cashbook Live Ledger
             </div>
           </div>
         </div>
       </nav>
 
       <main className="relative z-10 max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-7">
+        <section className="overflow-hidden rounded-[30px] border border-white/70 bg-white/85 backdrop-blur-xl shadow-[0_24px_90px_-40px_rgba(14,116,144,0.52)]">
+          <div className="grid gap-6 px-5 py-6 sm:px-6 lg:grid-cols-[1.35fr_1fr] lg:px-8">
+            <div>
+              <div className="inline-flex items-center gap-2 rounded-full border border-cyan-200 bg-cyan-50 px-4 py-1.5 text-sm font-semibold text-cyan-800">
+                <span className="h-2 w-2 rounded-full bg-cyan-500"></span>
+                Cashbook Intelligence
+              </div>
+              <h1 className="mt-4 text-3xl sm:text-4xl font-bold text-slate-900">Rich Cashbook Journal</h1>
+              <p className="mt-2 max-w-2xl text-sm sm:text-base text-slate-700">
+                Unified view of all cash movements with clear <span className="font-semibold text-emerald-700">Cash In</span> and <span className="font-semibold text-rose-700">Cash Out</span> marks across transfer, withdrawal, cheque, and mixed account transactions.
+              </p>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="rounded-3xl border border-emerald-300/70 bg-gradient-to-br from-emerald-500 to-teal-500 p-5 text-white shadow-lg shadow-emerald-300/45">
+                <p className="text-xs uppercase tracking-[0.2em] text-white/90">Cash In</p>
+                <p className="mt-2 text-2xl font-bold">{money(directionSummary.cashIn)}</p>
+              </div>
+              <div className="rounded-3xl border border-rose-300/70 bg-gradient-to-br from-rose-500 to-orange-500 p-5 text-white shadow-lg shadow-rose-300/45">
+                <p className="text-xs uppercase tracking-[0.2em] text-white/90">Cash Out</p>
+                <p className="mt-2 text-2xl font-bold">{money(directionSummary.cashOut)}</p>
+              </div>
+              <div className="rounded-3xl border border-cyan-200 bg-white p-5 shadow-sm sm:col-span-2">
+                <p className="text-xs uppercase tracking-[0.2em] text-cyan-700">Net Movement</p>
+                <p className="mt-2 text-xl font-bold text-slate-900">{money(directionSummary.net)}</p>
+                <p className="mt-1 text-xs text-slate-600">Filtered Transactions: {filteredJournalRows.length}</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section className="rounded-2xl border border-white/70 bg-white/90 backdrop-blur-lg shadow-[0_18px_65px_-35px_rgba(13,148,136,0.45)] overflow-hidden">
-          <div className="px-5 py-4 border-b border-gray-100 bg-gradient-to-r from-amber-50 to-orange-50">
-            <h2 className="text-base font-semibold text-gray-900">Transfer and Withdrawal Journal</h2>
-            <p className="text-xs text-gray-600 mt-1">Debit/Credit postings for funding transfers and cash withdrawals.</p>
+          <div className="px-5 py-4 border-b border-gray-100 bg-gradient-to-r from-amber-50 via-orange-50 to-rose-50">
+            <h2 className="text-base font-semibold text-black">All Cash Transactions Journal</h2>
+            <p className="text-xs text-black/70 mt-1">Search, filter, and audit transaction direction and account type in one place.</p>
           </div>
 
-          <div className="border-b border-gray-100 bg-white/80 px-5 py-4">
+          <div className="border-b border-gray-100 bg-white/85 px-5 py-4">
             <div className="grid grid-cols-1 gap-3 md:grid-cols-6">
               <select
                 value={journalFilters.entryType}
                 onChange={(e) => setJournalFilters((prev) => ({ ...prev, entryType: e.target.value }))}
-                className="rounded-xl border border-gray-300 text-sm text-black px-3 py-2.5 shadow-sm"
+                className="rounded-xl border border-cyan-200 bg-white text-sm text-black px-3 py-2.5 shadow-sm focus:border-cyan-400 focus:ring-2 focus:ring-cyan-100"
               >
                 <option value="all">All Entry Types</option>
                 <option value="transfer">Transfer</option>
                 <option value="withdrawal">Withdrawal</option>
+                <option value="invoice_payment">Invoice Payment</option>
+                <option value="grn_payment">GRN Payment</option>
+                <option value="credit_payment">Credit Payment</option>
               </select>
 
               <select
                 value={journalFilters.txMark}
                 onChange={(e) => setJournalFilters((prev) => ({ ...prev, txMark: e.target.value }))}
-                className="rounded-xl border border-gray-300 text-sm text-black px-3 py-2.5 shadow-sm"
+                className="rounded-xl border border-cyan-200 bg-white text-sm text-black px-3 py-2.5 shadow-sm focus:border-cyan-400 focus:ring-2 focus:ring-cyan-100"
               >
                 <option value="all">All Tx Marks</option>
                 <option value="Transfer In">Transfer In</option>
@@ -619,24 +806,36 @@ export default function CashBookPage() {
                 <option value="Pending Receipt">Pending Receipt</option>
                 <option value="Withdrawal">Withdrawal</option>
                 <option value="Transfer">Transfer</option>
+                <option value="Invoice Payment">Invoice Payment</option>
+                <option value="GRN Payment">GRN Payment</option>
+                <option value="Credit Payment">Credit Payment</option>
+              </select>
+
+              <select
+                value={journalFilters.cashDirection}
+                onChange={(e) => setJournalFilters((prev) => ({ ...prev, cashDirection: e.target.value }))}
+                className="rounded-xl border border-cyan-200 bg-white text-sm text-black px-3 py-2.5 shadow-sm focus:border-cyan-400 focus:ring-2 focus:ring-cyan-100"
+              >
+                <option value="all">All Directions</option>
+                <option value="cash_in">Cash In</option>
+                <option value="cash_out">Cash Out</option>
               </select>
 
               <select
                 value={journalFilters.accountMark}
                 onChange={(e) => setJournalFilters((prev) => ({ ...prev, accountMark: e.target.value }))}
-                className="rounded-xl border border-gray-300 text-sm text-black px-3 py-2.5 shadow-sm"
+                className="rounded-xl border border-cyan-200 bg-white text-sm text-black px-3 py-2.5 shadow-sm focus:border-cyan-400 focus:ring-2 focus:ring-cyan-100"
               >
-                <option value="all">All Accounts</option>
-                <option value="Cash">Cash</option>
-                <option value="Bank">Bank</option>
-                <option value="Cheque">Cheque</option>
-                <option value="Mixed">Mixed</option>
+                <option value="all">All Account Transactions</option>
+                <option value="cash">Cash Transactions</option>
+                <option value="bank">Bank Transactions</option>
+                <option value="cheque">Cheque Transactions</option>
               </select>
 
               <select
                 value={journalFilters.status}
                 onChange={(e) => setJournalFilters((prev) => ({ ...prev, status: e.target.value }))}
-                className="rounded-xl border border-gray-300 text-sm text-black px-3 py-2.5 shadow-sm"
+                className="rounded-xl border border-cyan-200 bg-white text-sm text-black px-3 py-2.5 shadow-sm focus:border-cyan-400 focus:ring-2 focus:ring-cyan-100"
               >
                 <option value="all">All Status</option>
                 <option value="pending">Pending</option>
@@ -648,14 +847,14 @@ export default function CashBookPage() {
                 type="date"
                 value={journalFilters.fromDate}
                 onChange={(e) => setJournalFilters((prev) => ({ ...prev, fromDate: e.target.value }))}
-                className="rounded-xl border border-gray-300 text-sm text-black px-3 py-2.5 shadow-sm"
+                className="rounded-xl border border-cyan-200 bg-white text-sm text-black px-3 py-2.5 shadow-sm focus:border-cyan-400 focus:ring-2 focus:ring-cyan-100"
               />
 
               <input
                 type="date"
                 value={journalFilters.toDate}
                 onChange={(e) => setJournalFilters((prev) => ({ ...prev, toDate: e.target.value }))}
-                className="rounded-xl border border-gray-300 text-sm text-black px-3 py-2.5 shadow-sm"
+                className="rounded-xl border border-cyan-200 bg-white text-sm text-black px-3 py-2.5 shadow-sm focus:border-cyan-400 focus:ring-2 focus:ring-cyan-100"
               />
 
               <input
@@ -663,7 +862,7 @@ export default function CashBookPage() {
                 value={journalFilters.search}
                 onChange={(e) => setJournalFilters((prev) => ({ ...prev, search: e.target.value }))}
                 placeholder="Search ref, note, account..."
-                className="rounded-xl border border-gray-300 text-sm text-black px-3 py-2.5 shadow-sm md:col-span-5"
+                className="rounded-xl border border-cyan-200 bg-white text-sm text-black px-3 py-2.5 shadow-sm md:col-span-5 focus:border-cyan-400 focus:ring-2 focus:ring-cyan-100"
               />
 
               <button
@@ -672,6 +871,7 @@ export default function CashBookPage() {
                   setJournalFilters({
                     entryType: 'all',
                     txMark: 'all',
+                    cashDirection: 'all',
                     accountMark: 'all',
                     status: 'all',
                     fromDate: '',
@@ -686,32 +886,51 @@ export default function CashBookPage() {
             </div>
           </div>
 
+          <div className="grid grid-cols-1 gap-3 border-b border-gray-100 bg-white/85 px-5 py-4 md:grid-cols-3">
+            <div className="rounded-xl border border-indigo-200 bg-indigo-50/70 px-3 py-2">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-indigo-700">Invoice Payments</p>
+              <p className="text-base font-bold text-indigo-900">{paymentPreview.invoice.count} entries</p>
+              <p className="text-sm font-semibold text-indigo-800">{money(paymentPreview.invoice.amount)}</p>
+            </div>
+            <div className="rounded-xl border border-fuchsia-200 bg-fuchsia-50/70 px-3 py-2">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-fuchsia-700">GRN Payments</p>
+              <p className="text-base font-bold text-fuchsia-900">{paymentPreview.grn.count} entries</p>
+              <p className="text-sm font-semibold text-fuchsia-800">{money(paymentPreview.grn.amount)}</p>
+            </div>
+            <div className="rounded-xl border border-violet-200 bg-violet-50/70 px-3 py-2">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-violet-700">Credit Payments</p>
+              <p className="text-base font-bold text-violet-900">{paymentPreview.credit.count} entries</p>
+              <p className="text-sm font-semibold text-violet-800">{money(paymentPreview.credit.amount)}</p>
+            </div>
+          </div>
+
           <div className="overflow-x-auto">
-            <table className="min-w-[900px] divide-y divide-gray-200">
-              <thead className="bg-slate-100/90">
+            <table className="min-w-[980px] divide-y divide-cyan-100">
+              <thead className="bg-gradient-to-r from-slate-100 via-cyan-50 to-emerald-50">
                 <tr>
-                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-slate-500 uppercase">Date</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-slate-500 uppercase">Type</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-slate-500 uppercase">Company</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-slate-500 uppercase">Debit</th>
-                  <th className="px-4 py-3 text-right text-xs font-semibold tracking-[0.12em] text-slate-500 uppercase">Debit Amount</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-slate-500 uppercase">Credit</th>
-                  <th className="px-4 py-3 text-right text-xs font-semibold tracking-[0.12em] text-slate-500 uppercase">Credit Amount</th>
-                  <th className="px-4 py-3 text-right text-xs font-semibold tracking-[0.12em] text-slate-500 uppercase">Balance (Account)</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-slate-500 uppercase">Status</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-slate-500 uppercase">Reference</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-black uppercase">Date</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-black uppercase">Type</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-black uppercase">Cashbook Mark</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-black uppercase">Company</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-black uppercase">Debit</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold tracking-[0.12em] text-black uppercase">Debit Amount</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-black uppercase">Credit</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold tracking-[0.12em] text-black uppercase">Credit Amount</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold tracking-[0.12em] text-black uppercase">Balance (Account)</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-black uppercase">Status</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold tracking-[0.12em] text-black uppercase">Reference</th>
                 </tr>
               </thead>
-              <tbody className="bg-white divide-y divide-gray-100">
+              <tbody className="bg-white divide-y divide-cyan-50">
                 {filteredJournalRows.length === 0 ? (
                   <tr>
-                    <td colSpan={10} className="px-4 py-10 text-center text-sm text-gray-500">No journal entries match current filters.</td>
+                    <td colSpan={11} className="px-4 py-10 text-center text-sm text-black/70">No journal entries match current filters.</td>
                   </tr>
                 ) : (
                   paginatedJournalEntries.map((entry, idx) => (
-                    <tr key={entry.id} className={`${idx % 2 === 0 ? 'bg-white' : 'bg-slate-50/45'} transition hover:bg-amber-50/35`}>
-                      <td className="px-4 py-3 text-sm text-gray-700">{formatJournalDateTime(entry.posted_at, entry.date)}</td>
-                      <td className="px-4 py-3 text-sm text-gray-700">
+                    <tr key={entry.id} className={`${idx % 2 === 0 ? 'bg-white' : 'bg-slate-50/40'} transition hover:bg-cyan-50/50`}>
+                      <td className="px-4 py-3 text-sm text-black">{formatJournalDateTime(entry.posted_at, entry.date)}</td>
+                      <td className="px-4 py-3 text-sm text-black">
                         <div className="flex flex-wrap items-center gap-1.5">
                           <span className="capitalize">{entry.entry_type || 'transfer'}</span>
                           <span
@@ -720,6 +939,12 @@ export default function CashBookPage() {
                                 ? 'bg-emerald-100 text-emerald-700'
                                 : entry.txMark === 'Transfer Out'
                                   ? 'bg-rose-100 text-rose-700'
+                                  : entry.txMark === 'Invoice Payment'
+                                    ? 'bg-indigo-100 text-indigo-700'
+                                    : entry.txMark === 'GRN Payment'
+                                      ? 'bg-fuchsia-100 text-fuchsia-700'
+                                      : entry.txMark === 'Credit Payment'
+                                        ? 'bg-violet-100 text-violet-700'
                                   : entry.txMark === 'Cheque Deposit'
                                     ? 'bg-cyan-100 text-cyan-700'
                                     : entry.txMark === 'Cheque Return'
@@ -748,7 +973,18 @@ export default function CashBookPage() {
                           </span>
                         </div>
                       </td>
-                      <td className="px-4 py-3 text-sm text-gray-900 font-semibold">{entry.company_name}</td>
+                      <td className="px-4 py-3 text-sm text-black">
+                        <span
+                          className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold ${
+                            entry.cashDirection === 'cash_in'
+                              ? 'bg-emerald-100 text-emerald-700'
+                              : 'bg-rose-100 text-rose-700'
+                          }`}
+                        >
+                          {entry.cashDirectionLabel}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-sm text-black font-semibold">{entry.company_name}</td>
                       <td className="px-4 py-3 text-sm text-emerald-700">{entry.displayDebitAccount}</td>
                       <td className="px-4 py-3 text-sm text-right font-semibold text-emerald-700">
                         {money(Number(entry.displayDebitAmount || 0))}
@@ -763,7 +999,7 @@ export default function CashBookPage() {
                           <span>{money(entry.runningBalance)}</span>
                         </div>
                       </td>
-                      <td className="px-4 py-3 text-sm text-gray-700">
+                      <td className="px-4 py-3 text-sm text-black">
                         <span
                           className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold ${
                             entry.status === 'pending'
@@ -776,7 +1012,7 @@ export default function CashBookPage() {
                           {entry.status || 'completed'}
                         </span>
                       </td>
-                      <td className="px-4 py-3 text-sm text-gray-700">{entry.reference || '-'}</td>
+                      <td className="px-4 py-3 text-sm text-black">{entry.reference || '-'}</td>
                     </tr>
                   ))
                 )}
@@ -784,8 +1020,8 @@ export default function CashBookPage() {
             </table>
           </div>
 
-          <div className="flex flex-col gap-3 border-t border-gray-100 bg-white/80 px-5 py-4 text-sm text-gray-600 sm:flex-row sm:items-center sm:justify-between">
-            <p>
+          <div className="flex flex-col gap-3 border-t border-gray-100 bg-white/90 px-5 py-4 text-sm text-black/80 sm:flex-row sm:items-center sm:justify-between">
+            <p className="font-medium">
               Showing {journalRangeStart}-{journalRangeEnd} of {filteredJournalRows.length} entries
               {filteredJournalRows.length !== journalRows.length ? ` (filtered from ${journalRows.length})` : ''}
             </p>
@@ -794,18 +1030,18 @@ export default function CashBookPage() {
                 type="button"
                 onClick={() => setJournalPage((prev) => Math.max(1, prev - 1))}
                 disabled={currentJournalPage === 1 || filteredJournalRows.length === 0}
-                className="rounded-full border border-gray-300 px-4 py-1.5 font-semibold text-gray-700 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50"
+                className="rounded-full border border-cyan-200 bg-white px-4 py-1.5 font-semibold text-cyan-800 transition hover:bg-cyan-50 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 Previous
               </button>
-              <span className="rounded-full border border-gray-200 bg-gray-50 px-3 py-1 font-semibold text-gray-700">
+              <span className="rounded-full border border-cyan-200 bg-cyan-50 px-3 py-1 font-semibold text-cyan-900">
                 Page {currentJournalPage} of {totalJournalPages}
               </span>
               <button
                 type="button"
                 onClick={() => setJournalPage((prev) => Math.min(totalJournalPages, prev + 1))}
                 disabled={currentJournalPage === totalJournalPages || filteredJournalRows.length === 0}
-                className="rounded-full border border-gray-300 px-4 py-1.5 font-semibold text-gray-700 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50"
+                className="rounded-full border border-cyan-200 bg-white px-4 py-1.5 font-semibold text-cyan-800 transition hover:bg-cyan-50 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 Next
               </button>

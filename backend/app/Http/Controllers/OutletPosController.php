@@ -194,6 +194,91 @@ class OutletPosController extends Controller
         return Outlet::where('user_id', $user->id)->where('status', 'active')->first();
     }
 
+    private function isGlobalAdmin($user): bool
+    {
+        if (!$user) {
+            return false;
+        }
+
+        if (!$user->employee_id) {
+            return true;
+        }
+
+        $user->loadMissing('roles');
+
+        $roles = $user->roles
+            ->pluck('name')
+            ->push((string) ($user->role ?? ''))
+            ->map(fn ($name) => strtolower(trim((string) $name)))
+            ->filter();
+
+        return $roles->contains(function ($roleName) {
+            return str_contains($roleName, 'super admin')
+                || str_contains($roleName, 'superadmin')
+                || str_contains($roleName, 'administrator');
+        });
+    }
+
+    private function resolveTenantContext(Request $request): array
+    {
+        $user = $request->user();
+        $user?->loadMissing('employee');
+
+        $tenantId = (int) (
+            $request->attributes->get('tenant_id')
+            ?? $user?->employee?->tenant_id
+            ?? $user?->branch_id
+            ?? 0
+        );
+
+        $branchId = (int) (
+            $request->attributes->get('branch_id')
+            ?? $user?->employee?->branch_id
+            ?? $user?->branch_id
+            ?? 0
+        );
+
+        return [
+            'tenant_id' => $tenantId,
+            'branch_id' => $branchId,
+            'is_global_admin' => $this->isGlobalAdmin($user),
+        ];
+    }
+
+    private function scopeOutletsByTenant($query, array $context)
+    {
+        if ($context['is_global_admin']) {
+            return $query;
+        }
+
+        if ($context['tenant_id'] > 0 && Schema::hasColumn('outlets', 'tenant_id')) {
+            $query->where('outlets.tenant_id', $context['tenant_id']);
+        }
+
+        if ($context['branch_id'] > 0 && Schema::hasColumn('outlets', 'branch_id')) {
+            $query->where('outlets.branch_id', $context['branch_id']);
+        }
+
+        return $query;
+    }
+
+    private function scopeOutletSalesByTenant($query, array $context)
+    {
+        if ($context['is_global_admin']) {
+            return $query;
+        }
+
+        if ($context['tenant_id'] > 0 && Schema::hasColumn('outlet_sales', 'tenant_id')) {
+            $query->where('outlet_sales.tenant_id', $context['tenant_id']);
+        }
+
+        if ($context['branch_id'] > 0 && Schema::hasColumn('outlet_sales', 'branch_id')) {
+            $query->where('outlet_sales.branch_id', $context['branch_id']);
+        }
+
+        return $query;
+    }
+
     private function stockByOutlet(int $outletId)
     {
         $transferred = DB::table('stock_transfers')
@@ -247,6 +332,41 @@ class OutletPosController extends Controller
                 'cashier_session' => $outlet ? $this->cashierSessionStatusByOutlet($outlet->id) : null,
             ],
             'message' => 'Outlet POS profile retrieved successfully',
+        ]);
+    }
+
+    public function outlets(Request $request): JsonResponse
+    {
+        $context = $this->resolveTenantContext($request);
+
+        if (!$context['is_global_admin'] && $context['tenant_id'] <= 0) {
+            return response()->json(['success' => false, 'message' => 'Forbidden'], 403);
+        }
+
+        $perPage = min(max((int) $request->get('per_page', 15), 1), 1000);
+
+        $query = Outlet::query()
+            ->select(['id', 'name', 'code', 'status'])
+            ->orderBy('name');
+
+        $this->scopeOutletsByTenant($query, $context);
+
+        if ($request->filled('status')) {
+            $query->where('status', (string) $request->status);
+        }
+
+        if ($request->filled('search')) {
+            $search = (string) $request->search;
+            $query->where(function ($subQuery) use ($search) {
+                $subQuery->where('name', 'like', "%{$search}%")
+                    ->orWhere('code', 'like', "%{$search}%");
+            });
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => $query->paginate($perPage),
+            'message' => 'Outlets retrieved successfully',
         ]);
     }
 
@@ -857,8 +977,13 @@ class OutletPosController extends Controller
         $user = $request->user();
         $admin = $this->isAdmin($user);
         $outlet = $this->getUserOutlet($user);
+        $context = $this->resolveTenantContext($request);
 
         if (!$admin && !$outlet) {
+            return response()->json(['success' => false, 'message' => 'Forbidden'], 403);
+        }
+
+        if (!$context['is_global_admin'] && $context['tenant_id'] <= 0) {
             return response()->json(['success' => false, 'message' => 'Forbidden'], 403);
         }
 
@@ -869,12 +994,24 @@ class OutletPosController extends Controller
             'items:id,outlet_sale_id,inventory_item_id,item_code,item_name,unit,issue_type,discount_amount,quantity,unit_price,line_total',
         ]);
 
+        $this->scopeOutletSalesByTenant($query, $context);
+
         if (!$admin && $outlet) {
             $query->where('outlet_id', $outlet->id);
         }
 
         if ($admin && $request->filled('outlet_id')) {
-            $query->where('outlet_id', $request->outlet_id);
+            $requestedOutletId = (int) $request->outlet_id;
+
+            if (!$context['is_global_admin']) {
+                $allowedOutletQuery = Outlet::query()->where('id', $requestedOutletId)->where('status', 'active');
+                $this->scopeOutletsByTenant($allowedOutletQuery, $context);
+                if (!$allowedOutletQuery->exists()) {
+                    return response()->json(['success' => false, 'message' => 'Forbidden'], 403);
+                }
+            }
+
+            $query->where('outlet_id', $requestedOutletId);
         }
 
         if ($request->filled('from_date')) {
@@ -927,8 +1064,13 @@ class OutletPosController extends Controller
         $user = $request->user();
         $admin = $this->isAdmin($user);
         $outlet = $this->getUserOutlet($user);
+        $context = $this->resolveTenantContext($request);
 
         if (!$admin && !$outlet) {
+            return response()->json(['success' => false, 'message' => 'Forbidden'], 403);
+        }
+
+        if (!$context['is_global_admin'] && $context['tenant_id'] <= 0) {
             return response()->json(['success' => false, 'message' => 'Forbidden'], 403);
         }
 
@@ -967,7 +1109,9 @@ class OutletPosController extends Controller
             ], 422);
         }
 
-        $activeOutlet = Outlet::where('id', $outletId)->where('status', 'active')->first();
+        $activeOutletQuery = Outlet::query()->where('id', $outletId)->where('status', 'active');
+        $this->scopeOutletsByTenant($activeOutletQuery, $context);
+        $activeOutlet = $activeOutletQuery->first();
         if (!$activeOutlet) {
             return response()->json(['success' => false, 'message' => 'Active outlet not found'], 404);
         }
@@ -1063,6 +1207,8 @@ class OutletPosController extends Controller
                     : 0;
 
                 $sale = OutletSale::create([
+                    'tenant_id' => $activeOutlet->tenant_id,
+                    'branch_id' => $activeOutlet->branch_id,
                     'sale_number' => 'OPS' . now()->format('YmdHis') . strtoupper(substr(md5((string) microtime(true)), 0, 4)),
                     'outlet_id' => $activeOutlet->id,
                     'sold_by' => $user?->id,
@@ -1161,15 +1307,23 @@ class OutletPosController extends Controller
     public function summary(Request $request): JsonResponse
     {
         $user = $request->user();
+        $context = $this->resolveTenantContext($request);
 
         if (!$this->isAdmin($user)) {
             return response()->json(['success' => false, 'message' => 'Admin access required'], 403);
+        }
+
+        if (!$context['is_global_admin'] && $context['tenant_id'] <= 0) {
+            return response()->json(['success' => false, 'message' => 'Forbidden'], 403);
         }
 
         $summaryQuery = OutletSale::query()
             ->join('outlets', 'outlet_sales.outlet_id', '=', 'outlets.id')
             ->selectRaw('outlet_sales.outlet_id, outlets.name as outlet_name, outlets.code as outlet_code, COUNT(outlet_sales.id) as total_sales, COALESCE(SUM(outlet_sales.total_quantity),0) as total_quantity, COALESCE(SUM(outlet_sales.total_amount),0) as total_amount')
             ->groupBy('outlet_sales.outlet_id', 'outlets.name', 'outlets.code');
+
+        $this->scopeOutletSalesByTenant($summaryQuery, $context);
+        $this->scopeOutletsByTenant($summaryQuery, $context);
 
         if ($request->filled('from_date')) {
             $summaryQuery->whereDate('outlet_sales.sale_date', '>=', $request->from_date);
@@ -1193,8 +1347,15 @@ class OutletPosController extends Controller
         $user = $request->user();
         $admin = $this->isAdmin($user);
         $userOutlet = $this->getUserOutlet($user);
+        $context = $this->resolveTenantContext($request);
 
-        $outlet = Outlet::find($outletId);
+        if (!$context['is_global_admin'] && $context['tenant_id'] <= 0) {
+            return response()->json(['success' => false, 'message' => 'Forbidden'], 403);
+        }
+
+        $outletQuery = Outlet::query()->where('id', $outletId);
+        $this->scopeOutletsByTenant($outletQuery, $context);
+        $outlet = $outletQuery->first();
         if (!$outlet) {
             return response()->json(['success' => false, 'message' => 'Outlet not found'], 404);
         }
@@ -1204,6 +1365,7 @@ class OutletPosController extends Controller
         }
 
         $baseQuery = OutletSale::query()->where('outlet_id', $outlet->id);
+        $this->scopeOutletSalesByTenant($baseQuery, $context);
 
         if ($request->filled('from_date')) {
             $baseQuery->whereDate('sale_date', '>=', $request->from_date);
@@ -1230,6 +1392,8 @@ class OutletPosController extends Controller
         $itemWiseQuery = OutletSaleItem::query()
             ->join('outlet_sales', 'outlet_sales.id', '=', 'outlet_sale_items.outlet_sale_id')
             ->where('outlet_sales.outlet_id', $outlet->id);
+
+        $this->scopeOutletSalesByTenant($itemWiseQuery, $context);
 
         if ($request->filled('from_date')) {
             $itemWiseQuery->whereDate('outlet_sales.sale_date', '>=', $request->from_date);

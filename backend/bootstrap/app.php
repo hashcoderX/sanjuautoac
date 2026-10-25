@@ -17,6 +17,8 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->alias([
             'verified' => \Illuminate\Auth\Middleware\EnsureEmailIsVerified::class,
             'permission' => \App\Http\Middleware\CheckPermission::class,
+            'tenant.scope' => \App\Http\Middleware\EnforceTenantScope::class,
+            'tenant.binding' => \App\Http\Middleware\EnforceTenantRouteBindings::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

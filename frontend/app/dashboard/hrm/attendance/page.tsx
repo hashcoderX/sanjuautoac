@@ -29,10 +29,15 @@ interface AttendanceRecord {
   employee: Employee;
 }
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
 export default function AttendancePage() {
   type NoticeTone = 'success' | 'error' | 'info';
 
   const [token, setToken] = useState('');
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
@@ -56,9 +61,110 @@ export default function AttendancePage() {
   const [noticeModal, setNoticeModal] = useState<{ title: string; message: string; tone: NoticeTone } | null>(null);
   const router = useRouter();
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+
+  const isColumnVisible = (key: string) => !hiddenModules.includes(key);
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
 
   const openNoticeModal = (tone: NoticeTone, title: string, message: string) => {
     setNoticeModal({ tone, title, message });
+  };
+
+  useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchAccessProfile = async (authToken: string) => {
+    try {
+      const [userRes, visibilityRes] = await Promise.all([
+        axios.get(`${API_URL}/api/user`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+      ]);
+
+      const superAdmin = isSuperAdminUser(userRes.data || {});
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching attendance page visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleAttendanceVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating attendance widget visibility:', error);
+      openNoticeModal('error', 'Update Failed', 'Unable to update widget visibility. Please try again.');
+    }
   };
 
   useEffect(() => {
@@ -67,6 +173,7 @@ export default function AttendancePage() {
       router.push('/');
     } else {
       setToken(storedToken);
+      fetchAccessProfile(storedToken);
       fetchEmployees(storedToken);
       fetchTodayAttendance(storedToken);
     }
@@ -337,23 +444,54 @@ export default function AttendancePage() {
 
       <main className="relative z-10 max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
         {/* Header */}
-        <div className="text-center mb-8">
-          <div className="inline-block p-1 bg-gradient-to-r from-orange-500 to-red-500 rounded-full mb-6">
-            <div className="bg-white rounded-full p-4">
-              <span className="text-4xl">📅</span>
+        {isElementVisible('hrm-attendance-el-title') && (
+          <div className="relative text-center mb-8">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-el-title', true); }}
+                className="absolute top-0 right-0 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                title="Hide section"
+                aria-label="Hide attendance title section"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M18 6 6 18" />
+                  <path d="m6 6 12 12" />
+                </svg>
+              </button>
+            )}
+            <div className="inline-block p-1 bg-gradient-to-r from-orange-500 to-red-500 rounded-full mb-6">
+              <div className="bg-white rounded-full p-4">
+                <span className="text-4xl">📅</span>
+              </div>
             </div>
+            <h2 className="text-3xl md:text-5xl font-bold text-gray-900 mb-3">
+              Attendance <span className="bg-gradient-to-r from-orange-600 to-red-600 bg-clip-text text-transparent">Manager</span>
+            </h2>
+            <p className="text-base sm:text-lg text-gray-600 max-w-3xl mx-auto leading-relaxed px-1">
+              Manage employee attendance with quick marking, CSV uploads, and history tracking.
+            </p>
           </div>
-          <h2 className="text-3xl md:text-5xl font-bold text-gray-900 mb-3">
-            Attendance <span className="bg-gradient-to-r from-orange-600 to-red-600 bg-clip-text text-transparent">Manager</span>
-          </h2>
-          <p className="text-base sm:text-lg text-gray-600 max-w-3xl mx-auto leading-relaxed px-1">
-            Manage employee attendance with quick marking, CSV uploads, and history tracking.
-          </p>
-        </div>
+        )}
 
         {/* Tabs */}
-        <div className="mb-6 flex justify-center">
-          <div className="bg-white/70 backdrop-blur-sm rounded-full p-1 shadow-lg inline-flex max-w-full overflow-x-auto">
+        {isElementVisible('hrm-attendance-el-tabs') && (
+          <div className="relative mb-6 flex justify-center">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-el-tabs', true); }}
+                className="absolute -top-2 right-0 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                title="Hide tabs"
+                aria-label="Hide tabs section"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M18 6 6 18" />
+                  <path d="m6 6 12 12" />
+                </svg>
+              </button>
+            )}
+            <div className="bg-white/70 backdrop-blur-sm rounded-full p-1 shadow-lg inline-flex max-w-full overflow-x-auto">
             <button
               onClick={() => setActiveTab('mark')}
               className={`px-6 py-2 rounded-full font-medium transition-all duration-300 ${
@@ -384,8 +522,9 @@ export default function AttendancePage() {
             >
               View History
             </button>
+            </div>
           </div>
-        </div>
+        )}
 
         {/* Tab Content */}
         {activeTab === 'mark' && (
@@ -393,33 +532,242 @@ export default function AttendancePage() {
             {/* Controls */}
             <div className="mb-6 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
               <div className="flex items-center gap-3">
-                <input
-                  type="text"
-                  placeholder="Search employees..."
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  className="w-full md:w-80 px-4 py-2 rounded-full border border-white/20 bg-white/70 backdrop-blur-sm text-gray-900 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-orange-500"
-                />
+                {isElementVisible('hrm-attendance-el-search') && (
+                  <div className="relative w-full md:w-80">
+                    {showWidgetCloseButtons && (
+                      <button
+                        type="button"
+                        onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-el-search', true); }}
+                        className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                        title="Hide search"
+                        aria-label="Hide employee search"
+                      >
+                        <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M18 6 6 18" />
+                          <path d="m6 6 12 12" />
+                        </svg>
+                      </button>
+                    )}
+                    <input
+                      type="text"
+                      placeholder="Search employees..."
+                      value={search}
+                      onChange={(e) => setSearch(e.target.value)}
+                      className="w-full px-4 py-2 rounded-full border border-white/20 bg-white/70 backdrop-blur-sm text-gray-900 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    />
+                  </div>
+                )}
               </div>
-              <div className="text-sm text-gray-600">
-                {loading ? 'Updating attendance...' : `${filteredEmployees.length} employees listed`}
-              </div>
+              {isElementVisible('hrm-attendance-el-count') && (
+                <div className="relative text-sm text-gray-600">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-el-count', true); }}
+                      className="absolute -top-2 -right-7 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide count"
+                      aria-label="Hide employee count"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  {loading ? 'Updating attendance...' : `${filteredEmployees.length} employees listed`}
+                </div>
+              )}
             </div>
 
             {/* Employees Table */}
-            <div className="bg-white/70 backdrop-blur-sm rounded-2xl shadow-lg border border-white/20 overflow-hidden">
+            {isElementVisible('hrm-attendance-sec-mark-table') && (
+            <div className="relative bg-white/70 backdrop-blur-sm rounded-2xl shadow-lg border border-white/20 overflow-hidden">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-sec-mark-table', true); }}
+                  className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                  title="Hide section"
+                  aria-label="Hide quick mark table section"
+                >
+                  <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M18 6 6 18" />
+                    <path d="m6 6 12 12" />
+                  </svg>
+                </button>
+              )}
               <div className="overflow-x-auto">
                 <table className="min-w-full divide-y divide-white/30">
                   <thead className="bg-gradient-to-r from-orange-500 to-red-500 text-white">
                     <tr>
-                      <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">Code</th>
-                      <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">Name</th>
-                      <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">Email</th>
-                      <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">Phone</th>
-                      <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">In Time</th>
-                      <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">Out Time</th>
-                      <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">Today's Status</th>
-                      <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">Actions</th>
+                      {isColumnVisible('hrm-attendance-col-code') && (
+                        <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">
+                          <div className="flex items-center gap-2">
+                            <span>Code</span>
+                            {showWidgetCloseButtons && (
+                              <button
+                                type="button"
+                                onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-col-code', true); }}
+                                className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                                title="Hide Code column"
+                                aria-label="Hide Code column"
+                              >
+                                <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M18 6 6 18" />
+                                  <path d="m6 6 12 12" />
+                                </svg>
+                              </button>
+                            )}
+                          </div>
+                        </th>
+                      )}
+                      {isColumnVisible('hrm-attendance-col-name') && (
+                        <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">
+                          <div className="flex items-center gap-2">
+                            <span>Name</span>
+                            {showWidgetCloseButtons && (
+                              <button
+                                type="button"
+                                onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-col-name', true); }}
+                                className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                                title="Hide Name column"
+                                aria-label="Hide Name column"
+                              >
+                                <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M18 6 6 18" />
+                                  <path d="m6 6 12 12" />
+                                </svg>
+                              </button>
+                            )}
+                          </div>
+                        </th>
+                      )}
+                      {isColumnVisible('hrm-attendance-col-email') && (
+                        <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">
+                          <div className="flex items-center gap-2">
+                            <span>Email</span>
+                            {showWidgetCloseButtons && (
+                              <button
+                                type="button"
+                                onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-col-email', true); }}
+                                className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                                title="Hide Email column"
+                                aria-label="Hide Email column"
+                              >
+                                <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M18 6 6 18" />
+                                  <path d="m6 6 12 12" />
+                                </svg>
+                              </button>
+                            )}
+                          </div>
+                        </th>
+                      )}
+                      {isColumnVisible('hrm-attendance-col-phone') && (
+                        <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">
+                          <div className="flex items-center gap-2">
+                            <span>Phone</span>
+                            {showWidgetCloseButtons && (
+                              <button
+                                type="button"
+                                onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-col-phone', true); }}
+                                className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                                title="Hide Phone column"
+                                aria-label="Hide Phone column"
+                              >
+                                <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M18 6 6 18" />
+                                  <path d="m6 6 12 12" />
+                                </svg>
+                              </button>
+                            )}
+                          </div>
+                        </th>
+                      )}
+                      {isColumnVisible('hrm-attendance-col-in-time') && (
+                        <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">
+                          <div className="flex items-center gap-2">
+                            <span>In Time</span>
+                            {showWidgetCloseButtons && (
+                              <button
+                                type="button"
+                                onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-col-in-time', true); }}
+                                className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                                title="Hide In Time column"
+                                aria-label="Hide In Time column"
+                              >
+                                <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M18 6 6 18" />
+                                  <path d="m6 6 12 12" />
+                                </svg>
+                              </button>
+                            )}
+                          </div>
+                        </th>
+                      )}
+                      {isColumnVisible('hrm-attendance-col-out-time') && (
+                        <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">
+                          <div className="flex items-center gap-2">
+                            <span>Out Time</span>
+                            {showWidgetCloseButtons && (
+                              <button
+                                type="button"
+                                onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-col-out-time', true); }}
+                                className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                                title="Hide Out Time column"
+                                aria-label="Hide Out Time column"
+                              >
+                                <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M18 6 6 18" />
+                                  <path d="m6 6 12 12" />
+                                </svg>
+                              </button>
+                            )}
+                          </div>
+                        </th>
+                      )}
+                      {isColumnVisible('hrm-attendance-col-status') && (
+                        <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">
+                          <div className="flex items-center gap-2">
+                            <span>Today's Status</span>
+                            {showWidgetCloseButtons && (
+                              <button
+                                type="button"
+                                onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-col-status', true); }}
+                                className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                                title="Hide Status column"
+                                aria-label="Hide Status column"
+                              >
+                                <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M18 6 6 18" />
+                                  <path d="m6 6 12 12" />
+                                </svg>
+                              </button>
+                            )}
+                          </div>
+                        </th>
+                      )}
+                      {isColumnVisible('hrm-attendance-col-actions') && (
+                        <th className="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">
+                          <div className="flex items-center gap-2">
+                            <span>Actions</span>
+                            {showWidgetCloseButtons && (
+                              <button
+                                type="button"
+                                onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-col-actions', true); }}
+                                className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                                title="Hide Actions column"
+                                aria-label="Hide Actions column"
+                              >
+                                <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M18 6 6 18" />
+                                  <path d="m6 6 12 12" />
+                                </svg>
+                              </button>
+                            )}
+                          </div>
+                        </th>
+                      )}
                     </tr>
                   </thead>
                   <tbody className="bg-white/60 divide-y divide-white/30">
@@ -436,17 +784,30 @@ export default function AttendancePage() {
                               'bg-blue-50/50'
                             : ''
                         }`}>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{emp.employee_code}</td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{emp.first_name} {emp.last_name}</td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{emp.email}</td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{emp.phone || emp.mobile || '-'}</td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
-                            {isMarked && attendance.in_time ? attendance.in_time : '-'}
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
-                            {isMarked && attendance.out_time ? attendance.out_time : '-'}
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm">
+                          {isColumnVisible('hrm-attendance-col-code') && (
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{emp.employee_code}</td>
+                          )}
+                          {isColumnVisible('hrm-attendance-col-name') && (
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{emp.first_name} {emp.last_name}</td>
+                          )}
+                          {isColumnVisible('hrm-attendance-col-email') && (
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{emp.email}</td>
+                          )}
+                          {isColumnVisible('hrm-attendance-col-phone') && (
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{emp.phone || emp.mobile || '-'}</td>
+                          )}
+                          {isColumnVisible('hrm-attendance-col-in-time') && (
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
+                              {isMarked && attendance.in_time ? attendance.in_time : '-'}
+                            </td>
+                          )}
+                          {isColumnVisible('hrm-attendance-col-out-time') && (
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">
+                              {isMarked && attendance.out_time ? attendance.out_time : '-'}
+                            </td>
+                          )}
+                          {isColumnVisible('hrm-attendance-col-status') && (
+                            <td className="px-6 py-4 whitespace-nowrap text-sm">
                             {isMarked ? (
                               <div className="flex items-center space-x-2">
                                 <span className={`px-2 py-1 rounded-full text-xs font-medium ${
@@ -464,8 +825,10 @@ export default function AttendancePage() {
                             ) : (
                               <span className="text-gray-400 text-xs">Not marked</span>
                             )}
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm">
+                            </td>
+                          )}
+                          {isColumnVisible('hrm-attendance-col-actions') && (
+                            <td className="px-6 py-4 whitespace-nowrap text-sm">
                             <div className="flex flex-wrap gap-2">
                               <button
                                 onClick={() => openMarkModal(emp, 'present')}
@@ -521,7 +884,8 @@ export default function AttendancePage() {
                                 </button>
                               )}
                             </div>
-                          </td>
+                            </td>
+                          )}
                         </tr>
                       );
                     })}
@@ -529,11 +893,26 @@ export default function AttendancePage() {
                 </table>
               </div>
             </div>
+            )}
           </>
         )}
 
-        {activeTab === 'upload' && (
-          <div className="bg-white/70 backdrop-blur-sm rounded-2xl shadow-lg border border-white/20 p-8">
+        {activeTab === 'upload' && isElementVisible('hrm-attendance-sec-upload') && (
+          <div className="relative bg-white/70 backdrop-blur-sm rounded-2xl shadow-lg border border-white/20 p-8">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-sec-upload', true); }}
+                className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                title="Hide section"
+                aria-label="Hide upload section"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M18 6 6 18" />
+                  <path d="m6 6 12 12" />
+                </svg>
+              </button>
+            )}
             <h3 className="text-2xl font-bold text-gray-900 mb-4">Upload Attendance CSV</h3>
             <p className="text-gray-600 mb-6">
               Upload a CSV from your fingerprint machine. Supported headers include both legacy format and fingerprint format.
@@ -580,8 +959,22 @@ export default function AttendancePage() {
           </div>
         )}
 
-        {activeTab === 'history' && (
-          <div className="bg-white/70 backdrop-blur-sm rounded-2xl shadow-lg border border-white/20 p-8">
+        {activeTab === 'history' && isElementVisible('hrm-attendance-sec-history') && (
+          <div className="relative bg-white/70 backdrop-blur-sm rounded-2xl shadow-lg border border-white/20 p-8">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleAttendanceVisibilityToggle('hrm-attendance-sec-history', true); }}
+                className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                title="Hide section"
+                aria-label="Hide history section"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M18 6 6 18" />
+                  <path d="m6 6 12 12" />
+                </svg>
+              </button>
+            )}
             <h3 className="text-2xl font-bold text-gray-900 mb-4">Attendance History</h3>
             <div className="mb-6 flex flex-col md:flex-row gap-4">
               <select

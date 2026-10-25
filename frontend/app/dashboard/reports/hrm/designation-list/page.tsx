@@ -92,15 +92,9 @@ export default function DesignationListReportPage() {
 
         const hasReportPermission = permissionNames.some((permission: string) => permission.includes('report'));
 
-        if (!isAdminUser && !hasReportPermission) {
-          router.push('/dashboard');
-          return;
-        }
-
         await fetchDesignationRows(token);
       } catch (error) {
         console.error('Error checking designation report access:', error);
-        router.push('/dashboard');
       } finally {
         setAccessReady(true);
       }

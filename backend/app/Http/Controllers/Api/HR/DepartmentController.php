@@ -3,7 +3,6 @@
 namespace App\Http\Controllers\Api\HR;
 
 use App\Http\Controllers\Controller;
-use App\Models\Company;
 use App\Models\Department;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
@@ -47,15 +46,14 @@ class DepartmentController extends Controller
             'branch_id' => 'nullable|integer|exists:companies,id',
         ]);
 
-        $defaultCompany = Company::query()->orderBy('id')->first();
-        if (!$defaultCompany) {
+        $tenantId = (int) ($validated['tenant_id'] ?? $request->user()?->employee?->tenant_id ?? $request->user()?->branch_id ?? 0);
+        $branchId = (int) ($validated['branch_id'] ?? $request->user()?->employee?->branch_id ?? $request->user()?->branch_id ?? 0);
+
+        if ($tenantId <= 0 || $branchId <= 0) {
             return response()->json([
-                'message' => 'Cannot create department: no company exists. Please create a company first.',
+                'message' => 'Cannot create department: tenant/branch is not resolved for this user.',
             ], 422);
         }
-
-        $tenantId = (int)($validated['tenant_id'] ?? $defaultCompany->id);
-        $branchId = (int)($validated['branch_id'] ?? $tenantId);
 
         $request->validate([
             'name' => [

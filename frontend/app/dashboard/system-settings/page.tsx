@@ -195,10 +195,6 @@ export default function SystemSettingsPage() {
     );
   }
 
-  if (!isAdmin) {
-    return null;
-  }
-
   return (
     <div className="min-h-screen bg-gradient-to-br from-emerald-50 via-teal-50 to-cyan-50 relative overflow-hidden">
       <div className="absolute inset-0 opacity-40 pointer-events-none">

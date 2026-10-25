@@ -30,6 +30,44 @@ interface GrnListRecord {
   grn_items?: Array<{ id: number }>;
 }
 
+interface GrnPaymentBreakdownEntry {
+  payment_type?: string;
+  payment_reference?: string | null;
+  paid_amount?: number;
+  paid_at?: string | null;
+}
+
+interface GrnDetailItem {
+  id: number;
+  received_quantity?: number;
+  accepted_quantity?: number;
+  rejected_quantity?: number;
+  purchase_price?: number;
+  sell_price?: number;
+  quality_status?: string;
+  remarks?: string | null;
+  expiry_date?: string | null;
+  purchase_order_item?: {
+    id?: number;
+    item_name?: string;
+    item_code?: string;
+    inventory_item?: {
+      id?: number;
+      name?: string;
+      code?: string;
+      unit?: string;
+    };
+  };
+}
+
+interface GrnDetailRecord extends GrnListRecord {
+  payment_reference?: string | null;
+  payment_note?: string | null;
+  paid_at?: string | null;
+  payment_breakdown?: GrnPaymentBreakdownEntry[] | null;
+  grn_items?: GrnDetailItem[];
+}
+
 interface GrnItemRow {
   id: number;
   itemName: string;
@@ -44,6 +82,23 @@ interface GrnItemRow {
   minSellingPrice: number;
 }
 
+interface InventorySuggestionItem {
+  id: number;
+  name: string;
+  code?: string | null;
+  unit_price?: number | null;
+  purchase_price?: number | null;
+  sell_price?: number | null;
+  additional_info?: Record<string, unknown> | string | null;
+}
+
+interface SplitPaymentRow {
+  id: number;
+  type: PaymentTypeOption;
+  reference: string;
+  amount: string;
+}
+
 const createEmptyRow = (id: number): GrnItemRow => ({
   id,
   itemName: '',
@@ -56,6 +111,13 @@ const createEmptyRow = (id: number): GrnItemRow => ({
   sellPrice: 0,
   maxDiscountPercentage: 0,
   minSellingPrice: 0,
+});
+
+const createSplitPaymentRow = (id: number): SplitPaymentRow => ({
+  id,
+  type: 'cash',
+  reference: '',
+  amount: '0',
 });
 
 const lineBuyTotal = (row: GrnItemRow): number => {
@@ -119,9 +181,14 @@ const buildAutoNumber = (prefix: string) => {
   return `${prefix}-${datePart}-${timePart}`;
 };
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
 export default function PurchasingGrnPage() {
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
   const [token, setToken] = useState('');
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [grnNo, setGrnNo] = useState('');
@@ -129,11 +196,16 @@ export default function PurchasingGrnPage() {
   const [selectedSupplierId, setSelectedSupplierId] = useState<number | ''>('');
   const [grnDate, setGrnDate] = useState(new Date().toISOString().split('T')[0]);
   const [rows, setRows] = useState<GrnItemRow[]>([createEmptyRow(1)]);
+  const [useMainItemTable, setUseMainItemTable] = useState(false);
+  const [itemSuggestionsByRow, setItemSuggestionsByRow] = useState<Record<number, InventorySuggestionItem[]>>({});
+  const [itemSuggestLoadingByRow, setItemSuggestLoadingByRow] = useState<Record<number, boolean>>({});
   const [discountAmount, setDiscountAmount] = useState('0');
   const [paymentTiming, setPaymentTiming] = useState<PaymentTiming>('post_payment');
   const [paymentType, setPaymentType] = useState<PaymentTypeOption>('cash');
   const [paymentReference, setPaymentReference] = useState('');
   const [paidAmount, setPaidAmount] = useState('0');
+  const [useMultiplePayments, setUseMultiplePayments] = useState(false);
+  const [splitPayments, setSplitPayments] = useState<SplitPaymentRow[]>([createSplitPaymentRow(1)]);
   const [saving, setSaving] = useState(false);
   const [formMessage, setFormMessage] = useState('');
   const [formMessageType, setFormMessageType] = useState<'success' | 'error' | ''>('');
@@ -145,10 +217,117 @@ export default function PurchasingGrnPage() {
   const [lastPage, setLastPage] = useState(1);
   const [totalRecords, setTotalRecords] = useState(0);
   const [perPage] = useState(15);
+  const [showDetailModal, setShowDetailModal] = useState(false);
+  const [selectedGrnDetail, setSelectedGrnDetail] = useState<GrnDetailRecord | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState('');
+  const itemSuggestDebounceRef = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
+
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+  const isColumnVisible = (key: string) => !hiddenModules.includes(key);
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchAccessProfile = async (authToken: string) => {
+    try {
+      const [userRes, visibilityRes] = await Promise.all([
+        axios.get(`${API_URL}/api/user`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+      ]);
+
+      const superAdmin = isSuperAdminUser(userRes.data || {});
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching purchasing GRN visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleGrnVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating purchasing GRN widget visibility:', error);
+    }
+  };
 
   useEffect(() => {
     const storedToken = localStorage.getItem('token');
-    if (storedToken) setToken(storedToken);
+    if (storedToken) {
+      setToken(storedToken);
+      fetchAccessProfile(storedToken);
+    }
+  }, []);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
   }, []);
 
   useEffect(() => {
@@ -203,6 +382,28 @@ export default function PurchasingGrnPage() {
     }
   };
 
+  const openGrnDetail = async (grnId: number) => {
+    if (!token) return;
+
+    setShowDetailModal(true);
+    setDetailLoading(true);
+    setDetailError('');
+    setSelectedGrnDetail(null);
+
+    try {
+      const response = await axios.get(`${API_URL}/api/purchasing/grn/${grnId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const payload = response.data?.data ?? response.data;
+      setSelectedGrnDetail(payload as GrnDetailRecord);
+    } catch (error) {
+      console.error('Error fetching GRN detail:', error);
+      setDetailError('Failed to load GRN details. Please try again.');
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
   const searchInitialized = useRef(false);
 
   useEffect(() => {
@@ -233,11 +434,16 @@ export default function PurchasingGrnPage() {
     setSelectedSupplierId('');
     setGrnDate(new Date().toISOString().split('T')[0]);
     setRows([createEmptyRow(1)]);
+    setUseMainItemTable(false);
+    setItemSuggestionsByRow({});
+    setItemSuggestLoadingByRow({});
     setDiscountAmount('0');
     setPaymentTiming('post_payment');
     setPaymentType('cash');
     setPaymentReference('');
     setPaidAmount('0');
+    setUseMultiplePayments(false);
+    setSplitPayments([createSplitPaymentRow(1)]);
     setFormMessage('');
     setFormMessageType('');
     setShowCreateModal(true);
@@ -248,6 +454,21 @@ export default function PurchasingGrnPage() {
   };
 
   const removeItemRow = (rowId: number) => {
+    const timer = itemSuggestDebounceRef.current[rowId];
+    if (timer) {
+      clearTimeout(timer);
+      delete itemSuggestDebounceRef.current[rowId];
+    }
+    setItemSuggestionsByRow((prev) => {
+      const next = { ...prev };
+      delete next[rowId];
+      return next;
+    });
+    setItemSuggestLoadingByRow((prev) => {
+      const next = { ...prev };
+      delete next[rowId];
+      return next;
+    });
     setRows((prev) => (prev.length === 1 ? prev : prev.filter((row) => row.id !== rowId)));
   };
 
@@ -267,6 +488,151 @@ export default function PurchasingGrnPage() {
       })
     );
   };
+
+  const addSplitPaymentRow = () => {
+    setSplitPayments((prev) => [...prev, createSplitPaymentRow((prev[prev.length - 1]?.id || 0) + 1)]);
+  };
+
+  const removeSplitPaymentRow = (rowId: number) => {
+    setSplitPayments((prev) => (prev.length === 1 ? prev : prev.filter((row) => row.id !== rowId)));
+  };
+
+  const updateSplitPaymentRow = (rowId: number, patch: Partial<SplitPaymentRow>) => {
+    setSplitPayments((prev) =>
+      prev.map((row) => {
+        if (row.id !== rowId) return row;
+        return { ...row, ...patch };
+      })
+    );
+  };
+
+  const parseAdditionalInfo = (value: InventorySuggestionItem['additional_info']): Record<string, unknown> => {
+    if (!value) return {};
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+      } catch {
+        return {};
+      }
+    }
+    return typeof value === 'object' ? value : {};
+  };
+
+  const fetchInventorySuggestions = async (rowId: number, rawQuery: string) => {
+    const query = rawQuery.trim();
+    if (!token || !useMainItemTable || query.length < 2) {
+      setItemSuggestionsByRow((prev) => ({ ...prev, [rowId]: [] }));
+      setItemSuggestLoadingByRow((prev) => ({ ...prev, [rowId]: false }));
+      return;
+    }
+
+    setItemSuggestLoadingByRow((prev) => ({ ...prev, [rowId]: true }));
+
+    try {
+      const response = await axios.get(`${API_URL}/api/stock/inventory`, {
+        headers: { Authorization: `Bearer ${token}` },
+        params: {
+          search: query,
+          per_page: 8,
+          status: 'active',
+        },
+      });
+
+      const data = response.data?.success ? response.data?.data : response.data;
+      const rowsData = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
+      const suggestions = rowsData.map((item: any) => ({
+        id: Number(item.id),
+        name: String(item.name || ''),
+        code: item.code ?? null,
+        unit_price: Number(item.unit_price) || 0,
+        purchase_price: Number(item.purchase_price) || 0,
+        sell_price: Number(item.sell_price) || 0,
+        additional_info: item.additional_info ?? null,
+      }));
+
+      setItemSuggestionsByRow((prev) => ({ ...prev, [rowId]: suggestions }));
+    } catch (error) {
+      console.error('Error fetching inventory suggestions:', error);
+      setItemSuggestionsByRow((prev) => ({ ...prev, [rowId]: [] }));
+    } finally {
+      setItemSuggestLoadingByRow((prev) => ({ ...prev, [rowId]: false }));
+    }
+  };
+
+  const handleItemNameInput = (rowId: number, value: string) => {
+    updateRow(rowId, { itemName: value });
+
+    if (!useMainItemTable) return;
+
+    // If user picked an exact suggestion label, apply it immediately.
+    tryApplySuggestionFromInput(rowId, value);
+
+    const existingTimer = itemSuggestDebounceRef.current[rowId];
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+
+    itemSuggestDebounceRef.current[rowId] = setTimeout(() => {
+      void fetchInventorySuggestions(rowId, value);
+    }, 250);
+  };
+
+  const applySuggestionToRow = (rowId: number, item: InventorySuggestionItem) => {
+    const info = parseAdditionalInfo(item.additional_info);
+    const code = String(item.code || '').trim();
+    const buyPrice = Number(item.purchase_price) > 0
+      ? Number(item.purchase_price)
+      : Number(item.unit_price) || 0;
+    const sellPrice = Number(item.sell_price) > 0
+      ? Number(item.sell_price)
+      : Number(item.unit_price) || 0;
+
+    const rawMaxDisc = Number(info.max_discount_percentage ?? info.maxDiscountPercentage ?? 0) || 0;
+    const safeMaxDisc = Math.min(Math.max(rawMaxDisc, 0), 100);
+
+    updateRow(rowId, {
+      itemName: item.name || '',
+      // In main item table mode, serial field should default to item code.
+      serialNo: code || String(info.serial_no ?? info.serialNo ?? ''),
+      model: String(info.model ?? ''),
+      brand: String(info.brand ?? ''),
+      warranty: String(info.warranty ?? ''),
+      buyPrice,
+      sellPrice,
+      maxDiscountPercentage: safeMaxDisc,
+    });
+
+    setItemSuggestionsByRow((prev) => ({ ...prev, [rowId]: [] }));
+  };
+
+  const getSuggestionLabel = (item: InventorySuggestionItem): string => {
+    const code = String(item.code || '').trim();
+    return code ? `${item.name} (${code})` : item.name;
+  };
+
+  const tryApplySuggestionFromInput = (rowId: number, value: string) => {
+    const input = value.trim().toLowerCase();
+    if (!input) return;
+
+    const candidates = itemSuggestionsByRow[rowId] || [];
+    const matched = candidates.find((item) => {
+      const byLabel = getSuggestionLabel(item).trim().toLowerCase() === input;
+      const byName = String(item.name || '').trim().toLowerCase() === input;
+      return byLabel || byName;
+    });
+
+    if (matched) {
+      applySuggestionToRow(rowId, matched);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      Object.values(itemSuggestDebounceRef.current).forEach((timer) => clearTimeout(timer));
+      itemSuggestDebounceRef.current = {};
+    };
+  }, []);
 
   const totalQuantity = useMemo(() => {
     return rows.reduce((sum, row) => sum + Math.max(Number(row.quantity) || 0, 0), 0);
@@ -288,10 +654,20 @@ export default function PurchasingGrnPage() {
 
   const effectivePaidAmount = useMemo(() => {
     if (paymentTiming === 'post_payment') return 0;
+
+    if (useMultiplePayments) {
+      const total = splitPayments.reduce((sum, row) => {
+        const amount = Number(row.amount || 0);
+        if (!Number.isFinite(amount) || amount <= 0) return sum;
+        return sum + amount;
+      }, 0);
+      return Math.min(total, netAmount);
+    }
+
     const raw = Number(paidAmount || 0);
     if (!Number.isFinite(raw) || raw <= 0) return 0;
     return Math.min(raw, netAmount);
-  }, [paidAmount, netAmount, paymentTiming]);
+  }, [paidAmount, netAmount, paymentTiming, useMultiplePayments, splitPayments]);
 
   const outstandingAmount = useMemo(() => {
     return Math.max(netAmount - effectivePaidAmount, 0);
@@ -362,8 +738,9 @@ export default function PurchasingGrnPage() {
 
     const timing: PaymentTiming = paymentTiming;
     let paid = 0;
-    let paymentTypeValue: PaymentTypeOption | null = null;
+    let paymentTypeValue: string | null = null;
     let paymentReferenceValue: string | null = null;
+    let paymentBreakdownValue: Array<{ payment_type: string; payment_reference?: string; paid_amount: number }> = [];
 
     if (timing === 'on_time') {
       paid = effectivePaidAmount;
@@ -372,8 +749,27 @@ export default function PurchasingGrnPage() {
         setFormMessageType('error');
         return;
       }
-      paymentTypeValue = paymentType;
-      paymentReferenceValue = paymentReference.trim() || grnNo || 'PAY-NOW';
+
+      if (useMultiplePayments) {
+        const positiveRows = splitPayments.filter((row) => (Number(row.amount || 0) || 0) > 0);
+        if (positiveRows.length === 0) {
+          setFormMessage('Add at least one payment split with amount greater than zero.');
+          setFormMessageType('error');
+          return;
+        }
+
+        paymentBreakdownValue = positiveRows.map((row) => ({
+          payment_type: row.type,
+          payment_reference: row.reference.trim() || undefined,
+          paid_amount: Number(row.amount || 0) || 0,
+        }));
+
+        paymentTypeValue = 'multiple';
+        paymentReferenceValue = grnNo || 'PAY-NOW';
+      } else {
+        paymentTypeValue = paymentType;
+        paymentReferenceValue = paymentReference.trim() || grnNo || 'PAY-NOW';
+      }
     }
 
     try {
@@ -473,6 +869,9 @@ export default function PurchasingGrnPage() {
       if (timing === 'on_time') {
         grnPayload.payment_type = paymentTypeValue || 'cash';
         grnPayload.payment_reference = paymentReferenceValue;
+        if (paymentBreakdownValue.length > 0) {
+          grnPayload.payment_breakdown = paymentBreakdownValue;
+        }
       }
 
       await axios.post(`${API_URL}/api/purchasing/grn`, grnPayload, {
@@ -508,10 +907,37 @@ export default function PurchasingGrnPage() {
     { value: 'paid', label: 'Paid' },
   ];
 
+  const visibleLedgerColumns = Math.max(
+    [
+      'purchasing-grn-col-grn-no',
+      'purchasing-grn-col-date',
+      'purchasing-grn-col-supplier',
+      'purchasing-grn-col-invoice',
+      'purchasing-grn-col-items',
+      'purchasing-grn-col-net',
+      'purchasing-grn-col-paid',
+      'purchasing-grn-col-balance',
+      'purchasing-grn-col-status',
+    ].filter((key) => isColumnVisible(key)).length,
+    1
+  );
+
   return (
     <div className="space-y-8 pb-10">
       {/* Hero */}
-      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-slate-900 via-cyan-950 to-teal-900 px-6 py-8 shadow-2xl shadow-cyan-900/20 sm:px-10 sm:py-10">
+      {isElementVisible('purchasing-grn-el-hero') && (
+        <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-slate-900 via-cyan-950 to-teal-900 px-6 py-8 shadow-2xl shadow-cyan-900/20 sm:px-10 sm:py-10">
+        {showWidgetCloseButtons && (
+          <button
+            type="button"
+            onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-el-hero', true); }}
+            className="absolute right-3 top-3 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-white/30 bg-white/10 text-sm font-bold text-white hover:bg-white/20"
+            title="Hide hero"
+            aria-label="Hide hero"
+          >
+            x
+          </button>
+        )}
         <div className="pointer-events-none absolute -right-16 -top-16 h-56 w-56 rounded-full bg-cyan-400/20 blur-3xl" />
         <div className="pointer-events-none absolute -bottom-20 left-10 h-48 w-48 rounded-full bg-teal-400/15 blur-3xl" />
         <div className="relative z-10 flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
@@ -527,42 +953,101 @@ export default function PurchasingGrnPage() {
               Receive stock directly from suppliers, set pricing, and manage pay-now or credit settlements in one flow.
             </p>
             <div className="mt-5 flex flex-wrap gap-3">
-              <Link
-                href="/dashboard/purchasing"
-                className="inline-flex items-center rounded-xl border border-white/20 bg-white/10 px-4 py-2 text-sm font-medium text-white backdrop-blur-sm transition hover:bg-white/20"
-              >
-                ← Purchasing Hub
-              </Link>
-              <Link
-                href="/dashboard/accounts/grn-payments"
-                className="inline-flex items-center rounded-xl border border-emerald-400/40 bg-emerald-500/20 px-4 py-2 text-sm font-medium text-emerald-50 transition hover:bg-emerald-500/30"
-              >
-                GRN Payments →
-              </Link>
+              {isElementVisible('purchasing-grn-el-hero-link-hub') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-el-hero-link-hub', true); }}
+                      className="absolute -right-2 -top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-white/30 bg-white/15 text-xs font-bold text-white hover:bg-white/25"
+                      title="Hide purchasing hub link"
+                      aria-label="Hide purchasing hub link"
+                    >
+                      x
+                    </button>
+                  )}
+                  <Link
+                    href="/dashboard/purchasing"
+                    className="inline-flex items-center rounded-xl border border-white/20 bg-white/10 px-4 py-2 text-sm font-medium text-white backdrop-blur-sm transition hover:bg-white/20"
+                  >
+                    ← Purchasing Hub
+                  </Link>
+                </div>
+              )}
+              {isElementVisible('purchasing-grn-el-hero-link-payments') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-el-hero-link-payments', true); }}
+                      className="absolute -right-2 -top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-white/30 bg-white/15 text-xs font-bold text-white hover:bg-white/25"
+                      title="Hide payments link"
+                      aria-label="Hide payments link"
+                    >
+                      x
+                    </button>
+                  )}
+                  <Link
+                    href="/dashboard/accounts/grn-payments"
+                    className="inline-flex items-center rounded-xl border border-emerald-400/40 bg-emerald-500/20 px-4 py-2 text-sm font-medium text-emerald-50 transition hover:bg-emerald-500/30"
+                  >
+                    GRN Payments →
+                  </Link>
+                </div>
+              )}
             </div>
           </div>
-          <button
-            type="button"
-            onClick={handleOpenCreate}
-            className="group relative inline-flex shrink-0 items-center justify-center gap-2 overflow-hidden rounded-2xl bg-gradient-to-r from-cyan-400 to-teal-400 px-8 py-4 text-base font-semibold text-slate-900 shadow-lg shadow-cyan-500/30 transition hover:scale-[1.02] hover:shadow-cyan-400/40 active:scale-[0.98]"
-          >
-            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-900/15 text-lg">+</span>
-            Create New GRN
-          </button>
+          {isElementVisible('purchasing-grn-el-btn-create') && (
+            <div className="relative">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-el-btn-create', true); }}
+                  className="absolute -right-2 -top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-white/30 bg-white/15 text-xs font-bold text-white hover:bg-white/25"
+                  title="Hide create button"
+                  aria-label="Hide create button"
+                >
+                  x
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleOpenCreate}
+                className="group relative inline-flex shrink-0 items-center justify-center gap-2 overflow-hidden rounded-2xl bg-gradient-to-r from-cyan-400 to-teal-400 px-8 py-4 text-base font-semibold text-slate-900 shadow-lg shadow-cyan-500/30 transition hover:scale-[1.02] hover:shadow-cyan-400/40 active:scale-[0.98]"
+              >
+                <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-900/15 text-lg">+</span>
+                Create New GRN
+              </button>
+            </div>
+          )}
         </div>
       </section>
+      )}
 
-      {formMessage && formMessageType === 'success' && (
-        <div className="flex items-start gap-3 rounded-2xl border border-emerald-200/80 bg-gradient-to-r from-emerald-50 to-teal-50 px-5 py-4 shadow-sm">
+      {formMessage && formMessageType === 'success' && isElementVisible('purchasing-grn-el-success-message') && (
+        <div className="relative flex items-start gap-3 rounded-2xl border border-emerald-200/80 bg-gradient-to-r from-emerald-50 to-teal-50 px-5 py-4 shadow-sm">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-el-success-message', true); }}
+              className="absolute right-2 top-2 inline-flex h-7 w-7 items-center justify-center rounded-full border border-emerald-200 bg-white text-sm font-bold text-emerald-700 hover:bg-emerald-50"
+              title="Hide success message"
+              aria-label="Hide success message"
+            >
+              x
+            </button>
+          )}
           <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-500 text-white text-sm">✓</span>
           <p className="text-sm font-medium text-emerald-900">{formMessage}</p>
         </div>
       )}
 
       {/* Stats */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      {isElementVisible('purchasing-grn-sec-stats') && (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {[
           {
+            key: 'purchasing-grn-el-stat-total-grns',
             label: 'Total GRNs',
             value: String(totalRecords),
             hint: 'All time records',
@@ -570,6 +1055,7 @@ export default function PurchasingGrnPage() {
             accent: 'from-cyan-500 to-blue-600',
           },
           {
+            key: 'purchasing-grn-el-stat-unpaid',
             label: 'Unpaid (page)',
             value: String(listStats.unpaid),
             hint: 'On current page',
@@ -577,6 +1063,7 @@ export default function PurchasingGrnPage() {
             accent: 'from-rose-500 to-orange-500',
           },
           {
+            key: 'purchasing-grn-el-stat-outstanding',
             label: 'Outstanding (page)',
             value: `LKR ${money(listStats.pageOutstanding)}`,
             hint: 'Balance on this page',
@@ -584,17 +1071,31 @@ export default function PurchasingGrnPage() {
             accent: 'from-violet-500 to-purple-600',
           },
           {
+            key: 'purchasing-grn-el-stat-suppliers',
             label: 'Suppliers',
             value: String(suppliers.length),
             hint: 'Available to select',
             icon: '🚚',
             accent: 'from-teal-500 to-emerald-600',
           },
-        ].map((card) => (
+        ]
+          .filter((card) => isElementVisible(card.key))
+          .map((card) => (
           <div
-            key={card.label}
+            key={card.key}
             className="group relative overflow-hidden rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md"
           >
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleGrnVisibilityToggle(card.key, true); }}
+                className="absolute right-2 top-2 z-10 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+                title={`Hide ${card.label}`}
+                aria-label={`Hide ${card.label}`}
+              >
+                x
+              </button>
+            )}
             <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${card.accent}`} />
             <div className="flex items-start justify-between gap-3">
               <div>
@@ -609,9 +1110,22 @@ export default function PurchasingGrnPage() {
           </div>
         ))}
       </div>
+      )}
 
       {/* Records */}
-      <section className="overflow-hidden rounded-3xl border border-slate-200/80 bg-white shadow-xl shadow-slate-200/50">
+      {isElementVisible('purchasing-grn-sec-ledger') && (
+        <section className="relative overflow-hidden rounded-3xl border border-slate-200/80 bg-white shadow-xl shadow-slate-200/50">
+        {showWidgetCloseButtons && (
+          <button
+            type="button"
+            onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-sec-ledger', true); }}
+            className="absolute right-3 top-3 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+            title="Hide GRN ledger"
+            aria-label="Hide GRN ledger"
+          >
+            x
+          </button>
+        )}
         <div className="border-b border-slate-100 bg-gradient-to-r from-slate-50 via-white to-cyan-50/40 px-5 py-6 sm:px-8">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
             <div>
@@ -621,35 +1135,63 @@ export default function PurchasingGrnPage() {
               </p>
             </div>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-              <div className="relative">
-                <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400">⌕</span>
-                <input
-                  type="search"
-                  value={listSearch}
-                  onChange={(e) => setListSearch(e.target.value)}
-                  placeholder="Search GRN, supplier, PO..."
-                  className="w-full rounded-xl border border-slate-200 bg-white py-2.5 pl-10 pr-4 text-sm text-slate-900 shadow-sm placeholder:text-slate-400 focus:border-cyan-400 focus:ring-4 focus:ring-cyan-100 focus:outline-none sm:w-72"
-                />
-              </div>
-              <div className="flex flex-wrap gap-1.5 rounded-xl border border-slate-200 bg-slate-50/80 p-1">
-                {filterPills.map((pill) => (
-                  <button
-                    key={pill.value}
-                    type="button"
-                    onClick={() => {
-                      setListPaymentFilter(pill.value);
-                      setCurrentPage(1);
-                    }}
-                    className={`rounded-lg px-3 py-1.5 text-xs font-semibold capitalize transition ${
-                      listPaymentFilter === pill.value
-                        ? 'bg-white text-cyan-700 shadow-sm ring-1 ring-cyan-200'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    {pill.label}
-                  </button>
-                ))}
-              </div>
+              {isElementVisible('purchasing-grn-el-search') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-el-search', true); }}
+                      className="absolute -right-2 -top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                      title="Hide search"
+                      aria-label="Hide search"
+                    >
+                      x
+                    </button>
+                  )}
+                  <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400">⌕</span>
+                  <input
+                    type="search"
+                    value={listSearch}
+                    onChange={(e) => setListSearch(e.target.value)}
+                    placeholder="Search GRN, supplier, PO..."
+                    className="w-full rounded-xl border border-slate-200 bg-white py-2.5 pl-10 pr-4 text-sm text-slate-900 shadow-sm placeholder:text-slate-400 focus:border-cyan-400 focus:ring-4 focus:ring-cyan-100 focus:outline-none sm:w-72"
+                  />
+                </div>
+              )}
+              {isElementVisible('purchasing-grn-el-filter-pills') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-el-filter-pills', true); }}
+                      className="absolute -right-2 -top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                      title="Hide payment filters"
+                      aria-label="Hide payment filters"
+                    >
+                      x
+                    </button>
+                  )}
+                  <div className="flex flex-wrap gap-1.5 rounded-xl border border-slate-200 bg-slate-50/80 p-1">
+                    {filterPills.map((pill) => (
+                      <button
+                        key={pill.value}
+                        type="button"
+                        onClick={() => {
+                          setListPaymentFilter(pill.value);
+                          setCurrentPage(1);
+                        }}
+                        className={`rounded-lg px-3 py-1.5 text-xs font-semibold capitalize transition ${
+                          listPaymentFilter === pill.value
+                            ? 'bg-white text-cyan-700 shadow-sm ring-1 ring-cyan-200'
+                            : 'text-slate-600 hover:text-slate-900'
+                        }`}
+                      >
+                        {pill.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -658,29 +1200,164 @@ export default function PurchasingGrnPage() {
           <table className="min-w-full">
             <thead>
               <tr className="bg-slate-900 text-left text-xs font-semibold uppercase tracking-wider text-slate-300">
-                <th className="px-5 py-3.5">GRN No</th>
-                <th className="px-5 py-3.5">Date</th>
-                <th className="px-5 py-3.5">Supplier</th>
-                <th className="px-5 py-3.5">Invoice</th>
-                <th className="px-5 py-3.5 text-right">Items</th>
-                <th className="px-5 py-3.5 text-right">Net (LKR)</th>
-                <th className="px-5 py-3.5 text-right">Paid</th>
-                <th className="px-5 py-3.5 text-right">Balance</th>
-                <th className="px-5 py-3.5">Status</th>
+                {isColumnVisible('purchasing-grn-col-grn-no') && (
+                  <th className="px-5 py-3.5 relative">
+                    GRN No
+                    {showWidgetCloseButtons && (
+                      <button
+                        type="button"
+                        onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-col-grn-no', true); }}
+                        className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                        title="Hide GRN no column"
+                        aria-label="Hide GRN no column"
+                      >
+                        x
+                      </button>
+                    )}
+                  </th>
+                )}
+                {isColumnVisible('purchasing-grn-col-date') && (
+                  <th className="px-5 py-3.5 relative">
+                    Date
+                    {showWidgetCloseButtons && (
+                      <button
+                        type="button"
+                        onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-col-date', true); }}
+                        className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                        title="Hide date column"
+                        aria-label="Hide date column"
+                      >
+                        x
+                      </button>
+                    )}
+                  </th>
+                )}
+                {isColumnVisible('purchasing-grn-col-supplier') && (
+                  <th className="px-5 py-3.5 relative">
+                    Supplier
+                    {showWidgetCloseButtons && (
+                      <button
+                        type="button"
+                        onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-col-supplier', true); }}
+                        className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                        title="Hide supplier column"
+                        aria-label="Hide supplier column"
+                      >
+                        x
+                      </button>
+                    )}
+                  </th>
+                )}
+                {isColumnVisible('purchasing-grn-col-invoice') && (
+                  <th className="px-5 py-3.5 relative">
+                    Invoice
+                    {showWidgetCloseButtons && (
+                      <button
+                        type="button"
+                        onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-col-invoice', true); }}
+                        className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                        title="Hide invoice column"
+                        aria-label="Hide invoice column"
+                      >
+                        x
+                      </button>
+                    )}
+                  </th>
+                )}
+                {isColumnVisible('purchasing-grn-col-items') && (
+                  <th className="px-5 py-3.5 text-right relative">
+                    Items
+                    {showWidgetCloseButtons && (
+                      <button
+                        type="button"
+                        onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-col-items', true); }}
+                        className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                        title="Hide items column"
+                        aria-label="Hide items column"
+                      >
+                        x
+                      </button>
+                    )}
+                  </th>
+                )}
+                {isColumnVisible('purchasing-grn-col-net') && (
+                  <th className="px-5 py-3.5 text-right relative">
+                    Net (LKR)
+                    {showWidgetCloseButtons && (
+                      <button
+                        type="button"
+                        onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-col-net', true); }}
+                        className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                        title="Hide net column"
+                        aria-label="Hide net column"
+                      >
+                        x
+                      </button>
+                    )}
+                  </th>
+                )}
+                {isColumnVisible('purchasing-grn-col-paid') && (
+                  <th className="px-5 py-3.5 text-right relative">
+                    Paid
+                    {showWidgetCloseButtons && (
+                      <button
+                        type="button"
+                        onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-col-paid', true); }}
+                        className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                        title="Hide paid column"
+                        aria-label="Hide paid column"
+                      >
+                        x
+                      </button>
+                    )}
+                  </th>
+                )}
+                {isColumnVisible('purchasing-grn-col-balance') && (
+                  <th className="px-5 py-3.5 text-right relative">
+                    Balance
+                    {showWidgetCloseButtons && (
+                      <button
+                        type="button"
+                        onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-col-balance', true); }}
+                        className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                        title="Hide balance column"
+                        aria-label="Hide balance column"
+                      >
+                        x
+                      </button>
+                    )}
+                  </th>
+                )}
+                {isColumnVisible('purchasing-grn-col-status') && (
+                  <th className="px-5 py-3.5 relative">
+                    Status
+                    {showWidgetCloseButtons && (
+                      <button
+                        type="button"
+                        onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-col-status', true); }}
+                        className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                        title="Hide status column"
+                        aria-label="Hide status column"
+                      >
+                        x
+                      </button>
+                    )}
+                  </th>
+                )}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {listLoading ? (
                 Array.from({ length: 5 }).map((_, i) => (
                   <tr key={i} className="animate-pulse">
-                    <td colSpan={9} className="px-5 py-4">
+                    <td colSpan={visibleLedgerColumns} className="px-5 py-4">
                       <div className="h-4 rounded-lg bg-slate-100" />
                     </td>
                   </tr>
                 ))
               ) : grnRecords.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="px-5 py-16 text-center">
+                  <td colSpan={visibleLedgerColumns} className="px-5 py-16 text-center">
                     <div className="mx-auto max-w-sm">
                       <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-cyan-100 to-teal-100 text-3xl">
                         📥
@@ -719,49 +1396,62 @@ export default function PurchasingGrnPage() {
                   return (
                     <tr
                       key={grn.id}
-                      className={`transition-colors hover:bg-cyan-50/40 ${index % 2 === 0 ? 'bg-white' : 'bg-slate-50/50'}`}
+                      onClick={() => {
+                        void openGrnDetail(grn.id);
+                      }}
+                      className={`cursor-pointer transition-colors hover:bg-cyan-50/40 ${index % 2 === 0 ? 'bg-white' : 'bg-slate-50/50'}`}
                     >
-                      <td className="px-5 py-4">
-                        <span className="font-mono text-sm font-bold text-cyan-700">{grn.grn_number}</span>
-                      </td>
-                      <td className="px-5 py-4 text-sm text-slate-600">{receivedDate}</td>
-                      <td className="px-5 py-4">
-                        <div className="flex items-center gap-2.5">
-                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-cyan-500 to-teal-600 text-xs font-bold text-white">
-                            {initial}
+                      {isColumnVisible('purchasing-grn-col-grn-no') && (
+                        <td className="px-5 py-4">
+                          <span className="font-mono text-sm font-bold text-cyan-700">{grn.grn_number}</span>
+                        </td>
+                      )}
+                      {isColumnVisible('purchasing-grn-col-date') && <td className="px-5 py-4 text-sm text-slate-600">{receivedDate}</td>}
+                      {isColumnVisible('purchasing-grn-col-supplier') && (
+                        <td className="px-5 py-4">
+                          <div className="flex items-center gap-2.5">
+                            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-cyan-500 to-teal-600 text-xs font-bold text-white">
+                              {initial}
+                            </span>
+                            <span className="text-sm font-medium text-slate-800">{supplierName}</span>
+                          </div>
+                        </td>
+                      )}
+                      {isColumnVisible('purchasing-grn-col-invoice') && <td className="px-5 py-4 text-sm text-slate-500">{parseInvoiceFromNotes(grn.notes)}</td>}
+                      {isColumnVisible('purchasing-grn-col-items') && (
+                        <td className="px-5 py-4 text-right">
+                          <span className="inline-flex min-w-[2rem] justify-center rounded-lg bg-slate-100 px-2 py-0.5 text-sm font-semibold text-slate-700">
+                            {itemCount}
                           </span>
-                          <span className="text-sm font-medium text-slate-800">{supplierName}</span>
-                        </div>
-                      </td>
-                      <td className="px-5 py-4 text-sm text-slate-500">{parseInvoiceFromNotes(grn.notes)}</td>
-                      <td className="px-5 py-4 text-right">
-                        <span className="inline-flex min-w-[2rem] justify-center rounded-lg bg-slate-100 px-2 py-0.5 text-sm font-semibold text-slate-700">
-                          {itemCount}
-                        </span>
-                      </td>
-                      <td className="px-5 py-4 text-right text-sm font-semibold text-slate-900">{money(net)}</td>
-                      <td className="px-5 py-4 text-right text-sm text-slate-600">{money(paid)}</td>
-                      <td className="px-5 py-4 text-right">
-                        {balance > 0 ? (
-                          <span className="text-sm font-bold text-rose-600">{money(balance)}</span>
-                        ) : (
-                          <span className="text-sm text-slate-400">—</span>
-                        )}
-                      </td>
-                      <td className="px-5 py-4">
-                        <div className="flex flex-col gap-1.5">
-                          <span
-                            className={`inline-flex w-fit rounded-full px-2.5 py-0.5 text-xs font-semibold capitalize ${paymentStatusBadge(grn.payment_status)}`}
-                          >
-                            {grn.payment_status}
-                          </span>
-                          <span
-                            className={`inline-flex w-fit rounded-full px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${paymentTimingBadge(timing)}`}
-                          >
-                            {timing === 'on_time' ? 'Pay now' : 'Credit'}
-                          </span>
-                        </div>
-                      </td>
+                        </td>
+                      )}
+                      {isColumnVisible('purchasing-grn-col-net') && <td className="px-5 py-4 text-right text-sm font-semibold text-slate-900">{money(net)}</td>}
+                      {isColumnVisible('purchasing-grn-col-paid') && <td className="px-5 py-4 text-right text-sm text-slate-600">{money(paid)}</td>}
+                      {isColumnVisible('purchasing-grn-col-balance') && (
+                        <td className="px-5 py-4 text-right">
+                          {balance > 0 ? (
+                            <span className="text-sm font-bold text-rose-600">{money(balance)}</span>
+                          ) : (
+                            <span className="text-sm text-slate-400">—</span>
+                          )}
+                        </td>
+                      )}
+                      {isColumnVisible('purchasing-grn-col-status') && (
+                        <td className="px-5 py-4">
+                          <div className="flex flex-col gap-1.5">
+                            <span
+                              className={`inline-flex w-fit rounded-full px-2.5 py-0.5 text-xs font-semibold capitalize ${paymentStatusBadge(grn.payment_status)}`}
+                            >
+                              {grn.payment_status}
+                            </span>
+                            <span
+                              className={`inline-flex w-fit rounded-full px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${paymentTimingBadge(timing)}`}
+                            >
+                              {timing === 'on_time' ? 'Pay now' : 'Credit'}
+                            </span>
+                          </div>
+                        </td>
+                      )}
                     </tr>
                   );
                 })
@@ -770,7 +1460,19 @@ export default function PurchasingGrnPage() {
           </table>
         </div>
 
-        <div className="flex flex-col gap-4 border-t border-slate-100 bg-slate-50/60 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-8">
+        {isElementVisible('purchasing-grn-sec-pagination') && (
+          <div className="relative flex flex-col gap-4 border-t border-slate-100 bg-slate-50/60 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-8">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleGrnVisibilityToggle('purchasing-grn-sec-pagination', true); }}
+              className="absolute right-2 top-2 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+              title="Hide pagination"
+              aria-label="Hide pagination"
+            >
+              x
+            </button>
+          )}
           <p className="text-sm text-slate-600">
             Showing <span className="font-semibold text-slate-900">{grnRecords.length}</span> of{' '}
             <span className="font-semibold text-slate-900">{totalRecords}</span> records
@@ -797,7 +1499,201 @@ export default function PurchasingGrnPage() {
             </button>
           </div>
         </div>
+        )}
       </section>
+      )}
+
+      {showDetailModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-3 backdrop-blur-md sm:p-4">
+          <div className="flex max-h-[95vh] w-full max-w-[95vw] flex-col overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-2xl shadow-cyan-900/30 xl:max-w-[1400px] [&_p]:!text-black [&_h3]:!text-black [&_h4]:!text-black [&_th]:!text-black [&_td]:!text-black [&_span]:!text-black [&_button]:!text-black">
+            <div className="relative shrink-0 overflow-hidden border-b border-slate-200 bg-gradient-to-r from-white via-slate-50 to-white px-6 py-5 sm:px-8">
+              <div className="relative flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-widest">GRN Details</p>
+                  <h3 className="mt-1 text-2xl font-bold text-white">
+                    {selectedGrnDetail?.grn_number || 'Loading...'}
+                  </h3>
+                  <p className="mt-1 text-sm">Full goods received note information</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowDetailModal(false)}
+                  className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-300 bg-white text-lg transition hover:bg-slate-50"
+                  aria-label="Close"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto bg-gradient-to-b from-slate-50/80 to-white p-5 sm:p-7 space-y-6">
+              {detailLoading ? (
+                <div className="flex items-center justify-center py-16">
+                  <div className="h-10 w-10 animate-spin rounded-full border-2 border-cyan-200 border-t-cyan-600" />
+                </div>
+              ) : detailError ? (
+                <div className="rounded-2xl border border-rose-200 bg-rose-50 px-5 py-4 text-sm text-rose-800">
+                  {detailError}
+                </div>
+              ) : selectedGrnDetail ? (
+                <>
+                  <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+                    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                      <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">GRN</p>
+                      <p className="mt-1 text-lg font-bold text-slate-900">{selectedGrnDetail.grn_number}</p>
+                      <p className="mt-2 text-sm text-slate-600">
+                        Date: {selectedGrnDetail.received_date ? new Date(selectedGrnDetail.received_date).toLocaleDateString() : '—'}
+                      </p>
+                      <p className="text-sm text-slate-600">
+                        PO: {selectedGrnDetail.purchase_order?.order_number || '—'}
+                      </p>
+                    </div>
+
+                    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                      <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Supplier</p>
+                      <p className="mt-1 text-lg font-bold text-slate-900">{selectedGrnDetail.purchase_order?.supplier?.name || '—'}</p>
+                      <p className="mt-2 text-sm text-slate-600">Invoice: {parseInvoiceFromNotes(selectedGrnDetail.notes)}</p>
+                      <p className="text-sm text-slate-600">Payment Timing: {selectedGrnDetail.payment_timing || '—'}</p>
+                    </div>
+
+                    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                      <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Payment</p>
+                      <p className="mt-1 text-sm text-slate-700">Type: {selectedGrnDetail.payment_type || '—'}</p>
+                      <p className="text-sm text-slate-700">Paid: LKR {money(Number(selectedGrnDetail.paid_amount) || 0)}</p>
+                      <p className="text-sm text-slate-700">
+                        Outstanding: LKR {money(Math.max((Number(selectedGrnDetail.net_amount) || 0) - (Number(selectedGrnDetail.paid_amount) || 0), 0))}
+                      </p>
+                      {selectedGrnDetail.paid_at && (
+                        <p className="text-sm text-slate-600">Paid At: {new Date(selectedGrnDetail.paid_at).toLocaleString()}</p>
+                      )}
+                    </div>
+                  </div>
+
+                  {Array.isArray(selectedGrnDetail.payment_breakdown) && selectedGrnDetail.payment_breakdown.length > 0 && (
+                    <div className="rounded-2xl border border-cyan-200 bg-cyan-50/40 p-4 shadow-sm">
+                      <p className="text-xs font-semibold uppercase tracking-wider text-cyan-700">Payment Breakdown</p>
+                      <div className="mt-3 overflow-x-auto">
+                        <table className="min-w-full text-sm">
+                          <thead>
+                            <tr className="border-b border-cyan-200 text-left text-xs uppercase tracking-wider text-cyan-700">
+                              <th className="px-2 py-2">Type</th>
+                              <th className="px-2 py-2">Reference</th>
+                              <th className="px-2 py-2 text-right">Amount</th>
+                              <th className="px-2 py-2">Paid At</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {selectedGrnDetail.payment_breakdown.map((entry, idx) => (
+                              <tr key={`${entry.payment_type || 'type'}-${idx}`} className="border-b border-cyan-100/80">
+                                <td className="px-2 py-2 capitalize">{String(entry.payment_type || '').replace('_', ' ') || '—'}</td>
+                                <td className="px-2 py-2">{entry.payment_reference || '—'}</td>
+                                <td className="px-2 py-2 text-right font-semibold">{money(Number(entry.paid_amount) || 0)}</td>
+                                <td className="px-2 py-2">{entry.paid_at ? new Date(entry.paid_at).toLocaleString() : '—'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+                    <div className="border-b border-slate-100 bg-slate-100 px-4 py-3">
+                      <h4 className="text-sm font-bold uppercase tracking-wider text-slate-700">Line Items</h4>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full text-sm">
+                        <thead>
+                          <tr className="bg-slate-50 text-left text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                            <th className="px-3 py-2.5">Item</th>
+                            <th className="px-3 py-2.5">Code</th>
+                            <th className="px-3 py-2.5 text-right">Received</th>
+                            <th className="px-3 py-2.5 text-right">Accepted</th>
+                            <th className="px-3 py-2.5 text-right">Rejected</th>
+                            <th className="px-3 py-2.5 text-right">Buy Price</th>
+                            <th className="px-3 py-2.5 text-right">Sell Price</th>
+                            <th className="px-3 py-2.5">Quality</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {(selectedGrnDetail.grn_items || []).map((item) => {
+                            const poItem = item.purchase_order_item;
+                            const inv = poItem?.inventory_item;
+                            const itemName = poItem?.item_name || inv?.name || '—';
+                            const itemCode = poItem?.item_code || inv?.code || '—';
+
+                            return (
+                              <tr key={item.id} className="bg-white">
+                                <td className="px-3 py-2.5 font-medium text-slate-800">{itemName}</td>
+                                <td className="px-3 py-2.5 text-slate-600">{itemCode}</td>
+                                <td className="px-3 py-2.5 text-right">{Number(item.received_quantity || 0).toFixed(2)}</td>
+                                <td className="px-3 py-2.5 text-right">{Number(item.accepted_quantity || 0).toFixed(2)}</td>
+                                <td className="px-3 py-2.5 text-right">{Number(item.rejected_quantity || 0).toFixed(2)}</td>
+                                <td className="px-3 py-2.5 text-right">{money(Number(item.purchase_price) || 0)}</td>
+                                <td className="px-3 py-2.5 text-right">{money(Number(item.sell_price) || 0)}</td>
+                                <td className="px-3 py-2.5 capitalize">{item.quality_status || 'pending'}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                    {[
+                      {
+                        label: 'Total Amount',
+                        value: `LKR ${money(Number(selectedGrnDetail.total_amount) || 0)}`,
+                        tone: 'slate',
+                      },
+                      {
+                        label: 'Discount',
+                        value: `LKR ${money(Number(selectedGrnDetail.discount_amount) || 0)}`,
+                        tone: 'slate',
+                      },
+                      {
+                        label: 'Net Amount',
+                        value: `LKR ${money(Number(selectedGrnDetail.net_amount) || 0)}`,
+                        tone: 'cyan',
+                      },
+                      {
+                        label: 'Paid Amount',
+                        value: `LKR ${money(Number(selectedGrnDetail.paid_amount) || 0)}`,
+                        tone: 'emerald',
+                      },
+                    ].map((tile) => (
+                      <div
+                        key={tile.label}
+                        className={`rounded-xl border px-3 py-3 ${
+                          tile.tone === 'cyan'
+                            ? 'border-cyan-200 bg-cyan-50'
+                            : tile.tone === 'emerald'
+                              ? 'border-emerald-200 bg-emerald-50'
+                              : 'border-slate-200 bg-slate-50'
+                        }`}
+                      >
+                        <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500">{tile.label}</p>
+                        <p className="mt-1 text-sm font-bold text-slate-900">{tile.value}</p>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : null}
+            </div>
+
+            <div className="flex shrink-0 justify-end border-t border-slate-200 bg-white px-5 py-4 sm:px-8">
+              <button
+                type="button"
+                onClick={() => setShowDetailModal(false)}
+                className="rounded-xl border border-slate-200 px-5 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showCreateModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-3 backdrop-blur-md sm:p-4">
@@ -884,13 +1780,29 @@ export default function PurchasingGrnPage() {
                     <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-white/15 text-xs">2</span>
                     Line Items
                   </h4>
-                  <button
-                    type="button"
-                    onClick={addItemRow}
-                    className="rounded-xl bg-gradient-to-r from-cyan-400 to-teal-400 px-4 py-2 text-xs font-bold text-slate-900 shadow-md transition hover:brightness-105"
-                  >
-                    + Add Item
-                  </button>
+                  <div className="flex items-center gap-3">
+                    <label className="inline-flex items-center gap-2 rounded-lg border border-cyan-200/80 bg-cyan-50/90 px-3 py-2 text-xs font-semibold text-cyan-800">
+                      <input
+                        type="checkbox"
+                        checked={useMainItemTable}
+                        onChange={(e) => {
+                          const checked = e.target.checked;
+                          setUseMainItemTable(checked);
+                          setItemSuggestionsByRow({});
+                          setItemSuggestLoadingByRow({});
+                        }}
+                        className="h-3.5 w-3.5 rounded border-cyan-300 text-cyan-600"
+                      />
+                      Load Item From Main Item Table
+                    </label>
+                    <button
+                      type="button"
+                      onClick={addItemRow}
+                      className="rounded-xl bg-gradient-to-r from-cyan-400 to-teal-400 px-4 py-2 text-xs font-bold text-slate-900 shadow-md transition hover:brightness-105"
+                    >
+                      + Add Item
+                    </button>
+                  </div>
                 </div>
                 <div className="overflow-x-auto">
                   <table className="min-w-full">
@@ -914,12 +1826,32 @@ export default function PurchasingGrnPage() {
                       {rows.map((row, rowIndex) => (
                         <tr key={row.id} className={rowIndex % 2 === 0 ? 'bg-white' : 'bg-slate-50/60'}>
                           <td className="px-3 py-2">
-                            <input
-                              value={row.itemName}
-                              onChange={(e) => updateRow(row.id, { itemName: e.target.value })}
-                              className={tableFieldClass}
-                              placeholder="Item name"
-                            />
+                            <div className="relative">
+                              <input
+                                value={row.itemName}
+                                onChange={(e) => handleItemNameInput(row.id, e.target.value)}
+                                onBlur={(e) => {
+                                  if (!useMainItemTable) return;
+                                  tryApplySuggestionFromInput(row.id, e.target.value);
+                                }}
+                                className={tableFieldClass}
+                                placeholder={useMainItemTable ? 'Type at least 2 letters for suggestions' : 'Item name'}
+                                autoComplete="off"
+                                list={useMainItemTable ? `grn-item-suggestions-${row.id}` : undefined}
+                              />
+
+                              {useMainItemTable && (
+                                <datalist id={`grn-item-suggestions-${row.id}`}>
+                                  {(itemSuggestionsByRow[row.id] || []).map((suggestion) => (
+                                    <option key={suggestion.id} value={getSuggestionLabel(suggestion)} />
+                                  ))}
+                                </datalist>
+                              )}
+
+                              {useMainItemTable && itemSuggestLoadingByRow[row.id] && (
+                                <p className="mt-1 text-[11px] font-medium text-cyan-700">Loading suggestions...</p>
+                              )}
+                            </div>
                           </td>
                           <td className="px-3 py-2">
                             <input
@@ -1054,6 +1986,8 @@ export default function PurchasingGrnPage() {
                         type="button"
                         onClick={() => {
                           setPaymentTiming('on_time');
+                          setUseMultiplePayments(false);
+                          setSplitPayments([createSplitPaymentRow(1)]);
                           setPaidAmount(netAmount > 0 ? netAmount.toFixed(2) : '0');
                         }}
                         className={`rounded-2xl border-2 p-4 text-left transition ${
@@ -1087,41 +2021,130 @@ export default function PurchasingGrnPage() {
                 </div>
 
                 {paymentTiming === 'on_time' && (
-                  <div className="grid grid-cols-1 gap-4 rounded-xl border border-cyan-100 bg-cyan-50/50 p-4 md:grid-cols-3">
-                    <div>
-                      <label className={labelClass}>Payment Type</label>
-                      <select
-                        value={paymentType}
-                        onChange={(e) => setPaymentType(e.target.value as PaymentTypeOption)}
-                        className={fieldClass}
-                      >
-                        {PAYMENT_TYPE_OPTIONS.map((option) => (
-                          <option key={option.value} value={option.value}>
-                            {option.label}
-                          </option>
+                  <div className="space-y-4 rounded-xl border border-cyan-100 bg-cyan-50/50 p-4">
+                    <label className="inline-flex items-center gap-2 rounded-lg border border-cyan-200 bg-white px-3 py-2 text-sm font-semibold text-cyan-800">
+                      <input
+                        type="checkbox"
+                        checked={useMultiplePayments}
+                        onChange={(e) => {
+                          const checked = e.target.checked;
+                          setUseMultiplePayments(checked);
+                          if (checked) {
+                            setSplitPayments([createSplitPaymentRow(1)]);
+                            setPaidAmount('0');
+                          } else {
+                            setPaymentType('cash');
+                            setPaymentReference('');
+                            setPaidAmount(netAmount > 0 ? netAmount.toFixed(2) : '0');
+                          }
+                        }}
+                        className="h-4 w-4 rounded border-cyan-300 text-cyan-600"
+                      />
+                      Use Multiple Payment Methods (Cash + Cheque / Bank Transfer)
+                    </label>
+
+                    {useMultiplePayments ? (
+                      <div className="space-y-3">
+                        {splitPayments.map((split) => (
+                          <div key={split.id} className="grid grid-cols-1 gap-3 rounded-xl border border-cyan-200 bg-white p-3 md:grid-cols-[1fr_1.2fr_1fr_auto]">
+                            <div>
+                              <label className={labelClass}>Type</label>
+                              <select
+                                value={split.type}
+                                onChange={(e) => updateSplitPaymentRow(split.id, { type: e.target.value as PaymentTypeOption })}
+                                className={fieldClass}
+                              >
+                                {PAYMENT_TYPE_OPTIONS.map((option) => (
+                                  <option key={option.value} value={option.value}>
+                                    {option.label}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                            <div>
+                              <label className={labelClass}>Reference</label>
+                              <input
+                                value={split.reference}
+                                onChange={(e) => updateSplitPaymentRow(split.id, { reference: e.target.value })}
+                                placeholder="Receipt / cheque / transfer ref"
+                                className={fieldClass}
+                              />
+                            </div>
+                            <div>
+                              <label className={labelClass}>Amount (LKR)</label>
+                              <input
+                                type="number"
+                                min="0"
+                                step="0.01"
+                                value={split.amount}
+                                onChange={(e) => updateSplitPaymentRow(split.id, { amount: e.target.value })}
+                                className={fieldClass}
+                              />
+                            </div>
+                            <div className="flex items-end">
+                              <button
+                                type="button"
+                                onClick={() => removeSplitPaymentRow(split.id)}
+                                className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700 transition hover:bg-rose-100"
+                                title="Remove payment split"
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          </div>
                         ))}
-                      </select>
-                    </div>
-                    <div>
-                      <label className={labelClass}>Payment Reference</label>
-                      <input
-                        value={paymentReference}
-                        onChange={(e) => setPaymentReference(e.target.value)}
-                        placeholder="Receipt / cheque / transfer ref"
-                        className={fieldClass}
-                      />
-                    </div>
-                    <div>
-                      <label className={labelClass}>Paid Amount (LKR)</label>
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.01"
-                        value={paidAmount}
-                        onChange={(e) => setPaidAmount(e.target.value)}
-                        className={fieldClass}
-                      />
-                    </div>
+
+                        <div className="flex items-center justify-between">
+                          <button
+                            type="button"
+                            onClick={addSplitPaymentRow}
+                            className="rounded-lg border border-cyan-300 bg-cyan-100 px-3 py-2 text-xs font-semibold text-cyan-800 transition hover:bg-cyan-200"
+                          >
+                            + Add Payment Split
+                          </button>
+                          <p className="text-xs font-semibold text-cyan-800">
+                            Split total: LKR {money(effectivePaidAmount)}
+                          </p>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                        <div>
+                          <label className={labelClass}>Payment Type</label>
+                          <select
+                            value={paymentType}
+                            onChange={(e) => setPaymentType(e.target.value as PaymentTypeOption)}
+                            className={fieldClass}
+                          >
+                            {PAYMENT_TYPE_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className={labelClass}>Payment Reference</label>
+                          <input
+                            value={paymentReference}
+                            onChange={(e) => setPaymentReference(e.target.value)}
+                            placeholder="Receipt / cheque / transfer ref"
+                            className={fieldClass}
+                          />
+                        </div>
+                        <div>
+                          <label className={labelClass}>Paid Amount (LKR)</label>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={paidAmount}
+                            onChange={(e) => setPaidAmount(e.target.value)}
+                            className={fieldClass}
+                          />
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 

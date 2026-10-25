@@ -99,15 +99,9 @@ export default function PayrollReportPage() {
 
         const hasReportPermission = permissionNames.some((permission: string) => permission.includes('report'));
 
-        if (!isAdminUser && !hasReportPermission) {
-          router.push('/dashboard');
-          return;
-        }
-
         await fetchPayrollRows(token, monthFilter || undefined);
       } catch (error) {
         console.error('Error checking payroll report access:', error);
-        router.push('/dashboard');
       } finally {
         setAccessReady(true);
       }

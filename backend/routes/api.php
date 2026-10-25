@@ -3,6 +3,8 @@
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\BackupRestoreSettingController;
 use App\Http\Controllers\CompanyController;
+use App\Http\Controllers\FeatureVisibilityController;
+use App\Http\Controllers\SaasJoinRequestController;
 use App\Http\Controllers\SecuritySettingController;
 use App\Http\Controllers\SystemResetController;
 use App\Http\Controllers\SystemSettingController;
@@ -50,41 +52,77 @@ Route::get('/user', function (Request $request) {
     return $user;
 })->middleware('auth:sanctum');
 
-Route::get('/users', function () {
-    return User::all();
-});
+Route::get('/users', function (Request $request) {
+    $user = $request->user();
+    if (!$user) {
+        return response()->json([], 401);
+    }
+
+    $user->loadMissing('roles', 'employee');
+
+    $roleNames = $user->roles
+        ->pluck('name')
+        ->push((string) ($user->role ?? ''))
+        ->map(fn ($name) => strtolower(trim((string) $name)))
+        ->filter();
+
+    $isPrivilegedAdmin = $roleNames->contains(function ($roleName) {
+        return str_contains($roleName, 'super admin')
+            || str_contains($roleName, 'superadmin')
+            || str_contains($roleName, 'administrator');
+    });
+
+    if ($isPrivilegedAdmin) {
+        return User::all();
+    }
+
+    $branchId = (int) ($user->employee?->branch_id ?? $user->branch_id ?? 0);
+    if ($branchId <= 0) {
+        return collect([$user]);
+    }
+
+    return User::where('branch_id', $branchId)->get();
+})->middleware(['auth:sanctum', 'tenant.scope']);
 
 Route::post('/register', [AuthController::class, 'register']);
 Route::post('/login', [AuthController::class, 'login']);
 Route::post('/logout', [AuthController::class, 'logout'])->middleware('auth:sanctum');
+Route::post('/saas/join-requests', [SaasJoinRequestController::class, 'store']);
 
-Route::middleware('auth:sanctum')->group(function () {
-    Route::apiResource('companies', CompanyController::class);
-    Route::get('petty-cash-transactions', [\App\Http\Controllers\PettyCashTransactionController::class, 'index']);
-    Route::post('petty-cash-transactions', [\App\Http\Controllers\PettyCashTransactionController::class, 'store']);
-    Route::delete('petty-cash-transactions/{id}', [\App\Http\Controllers\PettyCashTransactionController::class, 'destroy']);
-    Route::get('delivery-cash-transactions', [\App\Http\Controllers\DeliveryCashTransactionController::class, 'index']);
-    Route::post('delivery-cash-transactions', [\App\Http\Controllers\DeliveryCashTransactionController::class, 'store']);
-    Route::delete('delivery-cash-transactions/{id}', [\App\Http\Controllers\DeliveryCashTransactionController::class, 'destroy']);
-    Route::get('main-cash-transactions', [\App\Http\Controllers\MainCashTransactionController::class, 'index']);
-    Route::post('main-cash-transactions', [\App\Http\Controllers\MainCashTransactionController::class, 'store']);
-    Route::delete('main-cash-transactions/{id}', [\App\Http\Controllers\MainCashTransactionController::class, 'destroy']);
-    Route::get('cheque-registry', [\App\Http\Controllers\ChequeRegistryController::class, 'index']);
-    Route::post('cheque-registry/register', [\App\Http\Controllers\ChequeRegistryController::class, 'registerReceived']);
-    Route::post('cheque-registry/{id}/deposit', [\App\Http\Controllers\ChequeRegistryController::class, 'deposit']);
-    Route::post('cheque-registry/{id}/return', [\App\Http\Controllers\ChequeRegistryController::class, 'returnCheque']);
-    Route::post('cheque-registry/{id}/end-clearance', [\App\Http\Controllers\ChequeRegistryController::class, 'endClearance']);
-    Route::post('cheque-registry/issue', [\App\Http\Controllers\ChequeRegistryController::class, 'issueCheque']);
+Route::middleware(['auth:sanctum', 'tenant.scope'])->group(function () {
+    Route::middleware('tenant.binding')->group(function () {
+        Route::apiResource('companies', CompanyController::class);
+        Route::get('petty-cash-transactions', [\App\Http\Controllers\PettyCashTransactionController::class, 'index']);
+        Route::post('petty-cash-transactions', [\App\Http\Controllers\PettyCashTransactionController::class, 'store']);
+        Route::delete('petty-cash-transactions/{id}', [\App\Http\Controllers\PettyCashTransactionController::class, 'destroy']);
+        Route::get('delivery-cash-transactions', [\App\Http\Controllers\DeliveryCashTransactionController::class, 'index']);
+        Route::post('delivery-cash-transactions', [\App\Http\Controllers\DeliveryCashTransactionController::class, 'store']);
+        Route::delete('delivery-cash-transactions/{id}', [\App\Http\Controllers\DeliveryCashTransactionController::class, 'destroy']);
+        Route::get('main-cash-transactions', [\App\Http\Controllers\MainCashTransactionController::class, 'index']);
+        Route::post('main-cash-transactions', [\App\Http\Controllers\MainCashTransactionController::class, 'store']);
+        Route::delete('main-cash-transactions/{id}', [\App\Http\Controllers\MainCashTransactionController::class, 'destroy']);
+        Route::get('cheque-registry', [\App\Http\Controllers\ChequeRegistryController::class, 'index']);
+        Route::post('cheque-registry/register', [\App\Http\Controllers\ChequeRegistryController::class, 'registerReceived']);
+        Route::post('cheque-registry/{id}/deposit', [\App\Http\Controllers\ChequeRegistryController::class, 'deposit']);
+        Route::post('cheque-registry/{id}/return', [\App\Http\Controllers\ChequeRegistryController::class, 'returnCheque']);
+        Route::post('cheque-registry/{id}/end-clearance', [\App\Http\Controllers\ChequeRegistryController::class, 'endClearance']);
+        Route::post('cheque-registry/issue', [\App\Http\Controllers\ChequeRegistryController::class, 'issueCheque']);
+    });
     Route::get('system-settings', [SystemSettingController::class, 'show']);
     Route::put('system-settings', [SystemSettingController::class, 'update']);
     Route::get('security-settings', [SecuritySettingController::class, 'show']);
     Route::put('security-settings', [SecuritySettingController::class, 'update']);
     Route::get('backup-settings', [BackupRestoreSettingController::class, 'show']);
     Route::put('backup-settings', [BackupRestoreSettingController::class, 'update']);
+    Route::get('feature-visibility', [FeatureVisibilityController::class, 'index']);
+    Route::put('feature-visibility', [FeatureVisibilityController::class, 'update']);
+    Route::get('feature-visibility/employee/{employeeId}', [FeatureVisibilityController::class, 'employeeVisibility']);
+    Route::put('feature-visibility/employee/{employeeId}/unblock', [FeatureVisibilityController::class, 'employeeUnblock']);
+    Route::post('feature-visibility/verify-super-admin', [FeatureVisibilityController::class, 'verifySuperAdminCredentials']);
     Route::post('system/reset', [SystemResetController::class, 'reset']);
 
     // HRM Routes
-    Route::prefix('hr')->group(function () {
+    Route::prefix('hr')->middleware('tenant.binding')->group(function () {
         Route::apiResource('departments', DepartmentController::class);
         Route::apiResource('designations', DesignationController::class);
         Route::apiResource('employees', EmployeeController::class);
@@ -166,13 +204,17 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('users/{userId}/roles', [\App\Http\Controllers\RoleController::class, 'getUserRoles']);
 
     // Stock Management Routes
-    Route::apiResource('stock/suppliers', \App\Http\Controllers\SupplierController::class);
-    Route::apiResource('stock/inventory', \App\Http\Controllers\InventoryController::class);
-    Route::apiResource('stock/transfers', \App\Http\Controllers\StockTransferController::class)->only(['index', 'store']);
-    Route::get('stock/transfers/reference/{reference}', [\App\Http\Controllers\StockTransferController::class, 'detailsByReference']);
+    Route::middleware('tenant.binding')->group(function () {
+        Route::apiResource('stock/suppliers', \App\Http\Controllers\SupplierController::class);
+        Route::post('stock/inventory/import-csv', [\App\Http\Controllers\InventoryController::class, 'importCsv']);
+        Route::apiResource('stock/inventory', \App\Http\Controllers\InventoryController::class);
+        Route::apiResource('stock/transfers', \App\Http\Controllers\StockTransferController::class)->only(['index', 'store']);
+        Route::get('stock/transfers/reference/{reference}', [\App\Http\Controllers\StockTransferController::class, 'detailsByReference']);
+    });
 
     // Outlet POS Routes
     Route::get('outlet-pos/me', [\App\Http\Controllers\OutletPosController::class, 'me']);
+    Route::get('outlet-pos/outlets', [\App\Http\Controllers\OutletPosController::class, 'outlets']);
     Route::get('outlet-pos/sales', [\App\Http\Controllers\OutletPosController::class, 'index']);
     Route::post('outlet-pos/sales', [\App\Http\Controllers\OutletPosController::class, 'store']);
     Route::post('outlet-pos/cash-drawer-balance', [\App\Http\Controllers\OutletPosController::class, 'setCashDrawerBalance']);
@@ -187,21 +229,24 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('outlet-pos/outlets/{outlet}/sales-report', [\App\Http\Controllers\OutletPosController::class, 'outletSalesReport']);
 
     // Purchasing Routes
-    // Route::apiResource('purchasing/purchase-orders', PurchaseOrderController::class);
-    Route::apiResource('purchasing/purchase-orders', \App\Http\Controllers\Api\Purchasing\PurchaseOrderController::class);
-    Route::post('purchasing/grn/{grn}/payment', [GRNController::class, 'recordPayment']);
-    Route::apiResource('purchasing/grn', \App\Http\Controllers\Api\Purchasing\GRNController::class);
+    Route::middleware('tenant.binding')->group(function () {
+        Route::apiResource('purchasing/purchase-orders', \App\Http\Controllers\Api\Purchasing\PurchaseOrderController::class);
+        Route::post('purchasing/grn/{grn}/payment', [GRNController::class, 'recordPayment']);
+        Route::apiResource('purchasing/grn', \App\Http\Controllers\Api\Purchasing\GRNController::class);
+    });
 
-    // Job Cards
-    Route::get('job-cards/summary', [\App\Http\Controllers\Api\JobCardController::class, 'summary']);
-    Route::get('job-cards/{jobCard}/documents/latest-quotation', [\App\Http\Controllers\Api\JobCardDocumentController::class, 'latestQuotation']);
-    Route::get('job-cards/{jobCard}/documents', [\App\Http\Controllers\Api\JobCardDocumentController::class, 'index']);
-    Route::post('job-cards/{jobCard}/documents', [\App\Http\Controllers\Api\JobCardDocumentController::class, 'store']);
-    Route::get('job-card-documents/{jobCardDocument}', [\App\Http\Controllers\Api\JobCardDocumentController::class, 'show']);
-    Route::apiResource('job-cards', \App\Http\Controllers\Api\JobCardController::class);
+    // Job Cards and Service Invoices
+    Route::middleware('tenant.binding')->group(function () {
+        Route::get('job-cards/summary', [\App\Http\Controllers\Api\JobCardController::class, 'summary']);
+        Route::get('job-cards/{jobCard}/documents/latest-quotation', [\App\Http\Controllers\Api\JobCardDocumentController::class, 'latestQuotation']);
+        Route::get('job-cards/{jobCard}/documents', [\App\Http\Controllers\Api\JobCardDocumentController::class, 'index']);
+        Route::post('job-cards/{jobCard}/documents', [\App\Http\Controllers\Api\JobCardDocumentController::class, 'store']);
+        Route::get('job-card-documents/{jobCardDocument}', [\App\Http\Controllers\Api\JobCardDocumentController::class, 'show']);
+        Route::apiResource('job-cards', \App\Http\Controllers\Api\JobCardController::class);
 
-    Route::get('service-invoices/summary', [\App\Http\Controllers\Api\ServiceInvoiceController::class, 'summary']);
-    Route::get('service-invoices/latest-quotation', [\App\Http\Controllers\Api\ServiceInvoiceController::class, 'latestQuotation']);
-    Route::apiResource('service-invoices', \App\Http\Controllers\Api\ServiceInvoiceController::class)->only(['index', 'store', 'show']);
+        Route::get('service-invoices/summary', [\App\Http\Controllers\Api\ServiceInvoiceController::class, 'summary']);
+        Route::get('service-invoices/latest-quotation', [\App\Http\Controllers\Api\ServiceInvoiceController::class, 'latestQuotation']);
+        Route::apiResource('service-invoices', \App\Http\Controllers\Api\ServiceInvoiceController::class)->only(['index', 'store', 'show']);
+    });
 
 });

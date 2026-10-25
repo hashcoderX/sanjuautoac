@@ -9,6 +9,8 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 class OutletSale extends Model
 {
     protected $fillable = [
+        'tenant_id',
+        'branch_id',
         'sale_number',
         'outlet_id',
         'sold_by',

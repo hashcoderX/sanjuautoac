@@ -84,15 +84,9 @@ export default function FullStockReportPage() {
         const isAdminUser = !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin') || roleBlob.includes('administrator') || roleBlob.includes('admin');
         const hasReportPermission = permissionNames.some((permission: string) => permission.includes('report'));
 
-        if (!isAdminUser && !hasReportPermission) {
-          router.push('/dashboard');
-          return;
-        }
-
         await fetchRows(token);
       } catch (error) {
         console.error('Error checking full stock report access:', error);
-        router.push('/dashboard');
       } finally {
         setAccessReady(true);
       }

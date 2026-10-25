@@ -9,6 +9,8 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 class JobCard extends Model
 {
     protected $fillable = [
+        'tenant_id',
+        'branch_id',
         'job_card_number',
         'customer_name',
         'customer_phone',
@@ -25,6 +27,7 @@ class JobCard extends Model
         'priority',
         'status',
         'assigned_employee_id',
+        'assigned_employee_ids',
         'received_date',
         'promised_date',
         'estimated_cost',
@@ -39,6 +42,7 @@ class JobCard extends Model
         'estimated_cost' => 'decimal:2',
         'advance_amount' => 'decimal:2',
         'inspection_reviewed_at' => 'datetime',
+        'assigned_employee_ids' => 'array',
     ];
 
     public function assignedEmployee(): BelongsTo
@@ -59,6 +63,11 @@ class JobCard extends Model
     public function documents(): HasMany
     {
         return $this->hasMany(JobCardDocument::class);
+    }
+
+    public function images(): HasMany
+    {
+        return $this->hasMany(JobCardImage::class);
     }
 
     protected static function boot()

@@ -9,6 +9,8 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 class ServiceInvoice extends Model
 {
     protected $fillable = [
+        'tenant_id',
+        'branch_id',
         'document_type',
         'document_number',
         'document_date',

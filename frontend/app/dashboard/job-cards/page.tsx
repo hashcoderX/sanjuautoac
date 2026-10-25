@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
+import imageCompression from 'browser-image-compression';
 
 type JobStatus = 'pending' | 'in_progress' | 'on_hold' | 'completed' | 'delivered' | 'cancelled';
 type JobPriority = 'low' | 'normal' | 'high' | 'urgent';
@@ -37,9 +38,27 @@ interface JobCardRecord {
   advance_amount?: number | null;
   notes?: string | null;
   assigned_employee_id?: number | null;
+  assigned_employee_ids?: number[] | null;
   assigned_employee?: EmployeeOption | null;
+  assigned_employees?: EmployeeOption[];
+  images?: JobCardImageRecord[];
+  creator?: { id: number; name?: string; email?: string } | null;
   created_at?: string;
 }
+
+interface JobCardImageRecord {
+  id: number;
+  image_url: string;
+  original_name?: string | null;
+  mime_type?: string | null;
+  size_kb?: number | null;
+}
+
+type PendingImage = {
+  file: File;
+  previewUrl: string;
+  originalSize: number;
+};
 
 interface SummaryStats {
   active: number;
@@ -54,6 +73,12 @@ const labelClass = 'mb-1.5 block text-xs font-semibold uppercase tracking-wider 
 
 const money = (value: number) =>
   Number(value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+const formatFileSize = (bytes: number) => {
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Math.max(1, Math.round(kb))} KB`;
+  return `${(kb / 1024).toFixed(2)} MB`;
+};
 
 const employeeName = (emp?: EmployeeOption | null) => {
   if (!emp) return '—';
@@ -193,9 +218,14 @@ const buildDefaultDocLines = (job: JobCardRecord, type: DocumentType): DocLineRo
   return [createDocLine(1, desc, 1, unitPrice)];
 };
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
 export default function JobCardsPage() {
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
   const [token, setToken] = useState('');
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [employees, setEmployees] = useState<EmployeeOption[]>([]);
   const [records, setRecords] = useState<JobCardRecord[]>([]);
   const [summary, setSummary] = useState<SummaryStats>({ active: 0, pending: 0, in_progress: 0, completed_today: 0 });
@@ -207,6 +237,7 @@ export default function JobCardsPage() {
   const [totalRecords, setTotalRecords] = useState(0);
   const [perPage] = useState(15);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [editingJobId, setEditingJobId] = useState<number | null>(null);
   const [showReviewModal, setShowReviewModal] = useState(false);
   const [reviewJob, setReviewJob] = useState<JobCardRecord | null>(null);
   const [reviewInspection, setReviewInspection] = useState('');
@@ -235,6 +266,10 @@ export default function JobCardsPage() {
   const [docDropdownHighlight, setDocDropdownHighlight] = useState<number>(-1);
   const [showViewDocsModal, setShowViewDocsModal] = useState(false);
   const [viewDocsJob, setViewDocsJob] = useState<JobCardRecord | null>(null);
+  const [showViewJobModal, setShowViewJobModal] = useState(false);
+  const [viewJobDetail, setViewJobDetail] = useState<JobCardRecord | null>(null);
+  const [viewJobLoading, setViewJobLoading] = useState(false);
+  const [viewImagePreview, setViewImagePreview] = useState<JobCardImageRecord | null>(null);
   const [viewDocsList, setViewDocsList] = useState<JobCardDocumentRecord[]>([]);
   const [viewDocsLoading, setViewDocsLoading] = useState(false);
   const [viewDocsTab, setViewDocsTab] = useState<ViewDocsTab>('all');
@@ -255,18 +290,134 @@ export default function JobCardsPage() {
   const [inspectionReview, setInspectionReview] = useState('');
   const [inspectedByEmployeeId, setInspectedByEmployeeId] = useState<number | ''>('');
   const [priority, setPriority] = useState<JobPriority>('normal');
-  const [assignedEmployeeId, setAssignedEmployeeId] = useState<number | ''>('');
+  const [assignedEmployeeIds, setAssignedEmployeeIds] = useState<number[]>([]);
   const [receivedDate, setReceivedDate] = useState(new Date().toISOString().split('T')[0]);
   const [promisedDate, setPromisedDate] = useState('');
   const [estimatedCost, setEstimatedCost] = useState('');
   const [advanceAmount, setAdvanceAmount] = useState('');
   const [notes, setNotes] = useState('');
+  const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
+  const [imageUploadError, setImageUploadError] = useState('');
+  const [compressingImages, setCompressingImages] = useState(false);
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+
+  const isColumnVisible = (key: string) => !hiddenModules.includes(key);
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
 
   const searchInitialized = useRef(false);
+  const pendingImagesRef = useRef<PendingImage[]>([]);
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchAccessProfile = async (authToken: string) => {
+    try {
+      const [userRes, visibilityRes] = await Promise.all([
+        axios.get(`${API_URL}/api/user`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+      ]);
+
+      const superAdmin = isSuperAdminUser(userRes.data || {});
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching job cards visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleJobCardsVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating job cards widget visibility:', error);
+    }
+  };
 
   useEffect(() => {
     const storedToken = localStorage.getItem('token');
-    if (storedToken) setToken(storedToken);
+    if (storedToken) {
+      setToken(storedToken);
+      fetchAccessProfile(storedToken);
+    }
+  }, []);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
+
+  useEffect(() => {
+    pendingImagesRef.current = pendingImages;
+  }, [pendingImages]);
+
+  useEffect(() => {
+    return () => {
+      pendingImagesRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl));
+    };
   }, []);
 
   const listParams = useMemo(() => {
@@ -392,6 +543,72 @@ export default function JobCardsPage() {
     return () => clearTimeout(timer);
   }, [listSearch]);
 
+  const clearPendingImages = () => {
+    setPendingImages((prev) => {
+      prev.forEach((item) => URL.revokeObjectURL(item.previewUrl));
+      return [];
+    });
+  };
+
+  const handleSelectImages = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+
+    const MAX_IMAGES = 8;
+    const availableSlots = MAX_IMAGES - pendingImages.length;
+    if (availableSlots <= 0) {
+      setImageUploadError(`You can upload up to ${MAX_IMAGES} images.`);
+      return;
+    }
+
+    const sourceFiles = Array.from(files).slice(0, availableSlots);
+    setImageUploadError('');
+    setCompressingImages(true);
+
+    try {
+      const compressed = await Promise.all(
+        sourceFiles.map(async (file) => {
+          const compressedBlob = await imageCompression(file, {
+            maxSizeMB: 0.8,
+            maxWidthOrHeight: 1600,
+            useWebWorker: true,
+            initialQuality: 0.8,
+          });
+
+          const compressedFile = new File([compressedBlob], file.name, {
+            type: compressedBlob.type || file.type,
+            lastModified: Date.now(),
+          });
+
+          return {
+            file: compressedFile,
+            previewUrl: URL.createObjectURL(compressedFile),
+            originalSize: file.size,
+          } as PendingImage;
+        })
+      );
+
+      setPendingImages((prev) => [...prev, ...compressed]);
+      if (sourceFiles.length < Array.from(files).length) {
+        setImageUploadError(`Only ${MAX_IMAGES} images are allowed. Extra files were ignored.`);
+      }
+    } catch (error) {
+      console.error('Image compression failed:', error);
+      setImageUploadError('Failed to compress one or more images. Please try again.');
+    } finally {
+      setCompressingImages(false);
+    }
+  };
+
+  const removePendingImage = (index: number) => {
+    setPendingImages((prev) => {
+      const target = prev[index];
+      if (target) {
+        URL.revokeObjectURL(target.previewUrl);
+      }
+      return prev.filter((_, i) => i !== index);
+    });
+  };
+
   const resetForm = () => {
     setCustomerName('');
     setCustomerPhone('');
@@ -405,18 +622,62 @@ export default function JobCardsPage() {
     setInspectionReview('');
     setInspectedByEmployeeId('');
     setPriority('normal');
-    setAssignedEmployeeId('');
+    setAssignedEmployeeIds([]);
     setReceivedDate(new Date().toISOString().split('T')[0]);
     setPromisedDate('');
     setEstimatedCost('');
     setAdvanceAmount('');
     setNotes('');
+    clearPendingImages();
+    setImageUploadError('');
     setFormMessage('');
     setFormMessageType('');
+    setEditingJobId(null);
+  };
+
+  const handleCloseCreateModal = () => {
+    if (saving || compressingImages) return;
+    resetForm();
+    setShowCreateModal(false);
   };
 
   const handleOpenCreate = () => {
     resetForm();
+    setShowCreateModal(true);
+  };
+
+  const toDateInputValue = (value?: string | null) => {
+    if (!value) return '';
+    if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return '';
+    return parsed.toISOString().split('T')[0];
+  };
+
+  const handleOpenEdit = (job: JobCardRecord) => {
+    resetForm();
+    setEditingJobId(job.id);
+    setCustomerName(job.customer_name || '');
+    setCustomerPhone(job.customer_phone || '');
+    setCustomerEmail(job.customer_email || '');
+    setVehicleNo(job.vehicle_no || '');
+    setChassisNo(job.chassis_no || '');
+    setBrand(job.brand || '');
+    setModel(job.model || '');
+    setProblemDescription(job.problem_description || '');
+    setAccessoriesReceived(job.accessories_received || '');
+    setInspectionReview(job.inspection_review || '');
+    setPriority((job.priority || 'normal') as JobPriority);
+    const selectedTechs = Array.isArray(job.assigned_employee_ids) && job.assigned_employee_ids.length > 0
+      ? job.assigned_employee_ids
+      : (job.assigned_employee_id ? [job.assigned_employee_id] : []);
+    setAssignedEmployeeIds(selectedTechs);
+    setInspectedByEmployeeId(job.inspected_by_employee_id || selectedTechs[0] || '');
+    setReceivedDate(toDateInputValue(job.received_date) || new Date().toISOString().split('T')[0]);
+    setPromisedDate(toDateInputValue(job.promised_date));
+    setEstimatedCost(job.estimated_cost != null ? String(job.estimated_cost) : '');
+    setAdvanceAmount(job.advance_amount != null ? String(job.advance_amount) : '');
+    setNotes(job.notes || '');
     setShowCreateModal(true);
   };
 
@@ -444,39 +705,72 @@ export default function JobCardsPage() {
       setFormMessageType('error');
       return;
     }
+    if (compressingImages) {
+      setFormMessage('Please wait until image compression is complete.');
+      setFormMessageType('error');
+      return;
+    }
 
     try {
       setSaving(true);
       setFormMessage('');
+
+      const formData = new FormData();
+      formData.append('customer_name', customerName.trim());
+      formData.append('customer_phone', customerPhone.trim());
+      formData.append('problem_description', problemDescription.trim());
+      formData.append('priority', priority);
+      formData.append('status', 'pending');
+      formData.append('received_date', receivedDate);
+
+      if (customerEmail.trim()) formData.append('customer_email', customerEmail.trim());
+      if (vehicleNo.trim()) formData.append('vehicle_no', vehicleNo.trim().toUpperCase());
+      if (chassisNo.trim()) formData.append('chassis_no', chassisNo.trim().toUpperCase());
+      if (brand.trim()) formData.append('brand', brand.trim());
+      if (model.trim()) formData.append('model', model.trim());
+      if (accessoriesReceived.trim()) formData.append('accessories_received', accessoriesReceived.trim());
+      if (inspectionReview.trim()) formData.append('inspection_review', inspectionReview.trim());
+      if (promisedDate) formData.append('promised_date', promisedDate);
+      if (estimatedCost) formData.append('estimated_cost', String(Number(estimatedCost)));
+      if (advanceAmount) formData.append('advance_amount', String(Number(advanceAmount)));
+      if (notes.trim()) formData.append('notes', notes.trim());
+
+      const inspectorId = inspectionReview.trim() ? inspectedByEmployeeId || assignedEmployeeIds[0] || '' : '';
+      if (inspectorId) {
+        formData.append('inspected_by_employee_id', String(inspectorId));
+      }
+
+      if (assignedEmployeeIds.length > 0) {
+        formData.append('assigned_employee_id', String(assignedEmployeeIds[0]));
+        assignedEmployeeIds.forEach((id) => {
+          formData.append('assigned_employee_ids[]', String(id));
+        });
+      }
+
+      pendingImages.forEach((item) => {
+        formData.append('images[]', item.file);
+      });
+
+      const isEditing = Boolean(editingJobId);
+      if (isEditing && editingJobId) {
+        formData.append('_method', 'PUT');
+      }
+
       await axios.post(
-        `${API_URL}/api/job-cards`,
+        isEditing && editingJobId
+          ? `${API_URL}/api/job-cards/${editingJobId}`
+          : `${API_URL}/api/job-cards`,
+        formData,
         {
-          customer_name: customerName.trim(),
-          customer_phone: customerPhone.trim(),
-          customer_email: customerEmail.trim() || null,
-          vehicle_no: vehicleNo.trim().toUpperCase() || null,
-          chassis_no: chassisNo.trim().toUpperCase() || null,
-          brand: brand.trim() || null,
-          model: model.trim() || null,
-          problem_description: problemDescription.trim(),
-          accessories_received: accessoriesReceived.trim() || null,
-          inspection_review: inspectionReview.trim() || null,
-          inspected_by_employee_id: inspectionReview.trim()
-            ? inspectedByEmployeeId || assignedEmployeeId || null
-            : null,
-          priority,
-          assigned_employee_id: assignedEmployeeId || null,
-          received_date: receivedDate,
-          promised_date: promisedDate || null,
-          estimated_cost: estimatedCost ? Number(estimatedCost) : null,
-          advance_amount: advanceAmount ? Number(advanceAmount) : null,
-          notes: notes.trim() || null,
-          status: 'pending',
-        },
-        { headers: { Authorization: `Bearer ${token}` } }
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'multipart/form-data',
+          },
+        }
       );
-      setFormMessage('Job card created successfully.');
+      setFormMessage(isEditing ? 'Job card updated successfully.' : 'Job card created successfully.');
       setFormMessageType('success');
+      resetForm();
       setShowCreateModal(false);
       setCurrentPage(1);
       await fetchRecords(1);
@@ -833,6 +1127,45 @@ export default function JobCardsPage() {
     return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
   };
 
+  const fmtDateTime = (value?: string | null) => {
+    if (!value) return '—';
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return value;
+    return d.toLocaleString('en-GB', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  };
+
+  const handleOpenViewJob = async (job: JobCardRecord) => {
+    setShowViewJobModal(true);
+    setViewJobLoading(true);
+    setViewJobDetail(job);
+
+    if (!token) {
+      setViewJobLoading(false);
+      return;
+    }
+
+    try {
+      const res = await axios.get(`${API_URL}/api/job-cards/${job.id}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const payload = res.data?.success ? res.data.data : res.data?.data || res.data;
+      if (payload) {
+        setViewJobDetail(payload as JobCardRecord);
+      }
+    } catch (error) {
+      console.error('Error loading job card details:', error);
+      alert(extractApiError(error, 'Failed to load full job card details.'));
+    } finally {
+      setViewJobLoading(false);
+    }
+  };
+
   const handleStatusChange = async (jobCard: JobCardRecord, newStatus: JobStatus) => {
     if (!token || jobCard.status === newStatus) return;
     try {
@@ -860,35 +1193,96 @@ export default function JobCardsPage() {
     { value: 'all', label: 'All Records' },
   ];
 
+  const visibleJobCardColumnCount = [
+    'job-cards-col-job-card',
+    'job-cards-col-customer',
+    'job-cards-col-vehicle',
+    'job-cards-col-problem',
+    'job-cards-col-technician',
+    'job-cards-col-inspection',
+    'job-cards-col-received',
+    'job-cards-col-est-cost',
+    'job-cards-col-status',
+    'job-cards-col-actions',
+  ].filter((key) => isColumnVisible(key)).length;
+
   return (
     <div className="space-y-8 pb-10">
-      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-indigo-950 via-violet-950 to-purple-900 px-6 py-8 shadow-2xl shadow-indigo-900/30 sm:px-10 sm:py-10">
-        <div className="pointer-events-none absolute -right-16 -top-16 h-56 w-56 rounded-full bg-violet-400/20 blur-3xl" />
-        <div className="pointer-events-none absolute -bottom-20 left-10 h-48 w-48 rounded-full bg-indigo-400/15 blur-3xl" />
-        <div className="relative z-10 flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
-          <div className="max-w-2xl">
-            <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1 text-xs font-medium uppercase tracking-widest text-indigo-100 backdrop-blur-sm">
-              <span className="h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.9)]" />
-              Service · Job Cards
+      {isElementVisible('job-cards-el-hero') && (
+        <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-indigo-950 via-violet-950 to-purple-900 px-6 py-8 shadow-2xl shadow-indigo-900/30 sm:px-10 sm:py-10">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleJobCardsVisibilityToggle('job-cards-el-hero', true); }}
+              className="absolute top-3 right-3 z-20 flex h-8 w-8 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide section"
+              aria-label="Hide hero section"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
+          <div className="pointer-events-none absolute -right-16 -top-16 h-56 w-56 rounded-full bg-violet-400/20 blur-3xl" />
+          <div className="pointer-events-none absolute -bottom-20 left-10 h-48 w-48 rounded-full bg-indigo-400/15 blur-3xl" />
+          <div className="relative z-10 flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
+            <div className="max-w-2xl">
+              <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1 text-xs font-medium uppercase tracking-widest text-indigo-100 backdrop-blur-sm">
+                <span className="h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.9)]" />
+                Service · Job Cards
+              </div>
+              <h1 className="text-3xl font-bold tracking-tight text-white sm:text-4xl">Job Card Management</h1>
+              <p className="mt-3 text-sm leading-relaxed text-indigo-100/90 sm:text-base">
+                Register vehicle service jobs, track pending work, and assign technicians from one workspace.
+              </p>
             </div>
-            <h1 className="text-3xl font-bold tracking-tight text-white sm:text-4xl">Job Card Management</h1>
-            <p className="mt-3 text-sm leading-relaxed text-indigo-100/90 sm:text-base">
-              Register vehicle service jobs, track pending work, and assign technicians from one workspace.
-            </p>
+            {isElementVisible('job-cards-el-btn-new') && (
+              <div className="relative">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handleJobCardsVisibilityToggle('job-cards-el-btn-new', true); }}
+                    className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide button"
+                    aria-label="Hide new job card button"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={handleOpenCreate}
+                  className="group inline-flex shrink-0 items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-amber-400 to-orange-400 px-8 py-4 text-base font-semibold text-slate-900 shadow-lg shadow-amber-500/30 transition hover:scale-[1.02] active:scale-[0.98]"
+                >
+                  <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-900/15 text-lg">+</span>
+                  New Job Card
+                </button>
+              </div>
+            )}
           </div>
-          <button
-            type="button"
-            onClick={handleOpenCreate}
-            className="group inline-flex shrink-0 items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-amber-400 to-orange-400 px-8 py-4 text-base font-semibold text-slate-900 shadow-lg shadow-amber-500/30 transition hover:scale-[1.02] active:scale-[0.98]"
-          >
-            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-900/15 text-lg">+</span>
-            New Job Card
-          </button>
-        </div>
-      </section>
+        </section>
+      )}
 
-      {formMessage && formMessageType === 'success' && !showCreateModal && (
-        <div className="flex items-start gap-3 rounded-2xl border border-emerald-200/80 bg-gradient-to-r from-emerald-50 to-teal-50 px-5 py-4 shadow-sm">
+      {formMessage && formMessageType === 'success' && !showCreateModal && isElementVisible('job-cards-el-success-message') && (
+        <div className="relative flex items-start gap-3 rounded-2xl border border-emerald-200/80 bg-gradient-to-r from-emerald-50 to-teal-50 px-5 py-4 shadow-sm">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleJobCardsVisibilityToggle('job-cards-el-success-message', true); }}
+              className="absolute top-2 right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide message"
+              aria-label="Hide success message"
+            >
+              <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
           <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-500 text-sm text-white">✓</span>
           <p className="text-sm font-medium text-emerald-900">{formMessage}</p>
         </div>
@@ -900,25 +1294,65 @@ export default function JobCardsPage() {
           { label: 'Pending', value: String(summary.pending), hint: 'Awaiting start', icon: '⏳', accent: 'from-amber-500 to-orange-500' },
           { label: 'In Progress', value: String(summary.in_progress), hint: 'Currently working', icon: '⚡', accent: 'from-sky-500 to-blue-600' },
           { label: 'Completed Today', value: String(summary.completed_today), hint: 'Finished today', icon: '✅', accent: 'from-emerald-500 to-teal-600' },
-        ].map((card) => (
-          <div
-            key={card.label}
-            className="group relative overflow-hidden rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md"
-          >
-            <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${card.accent}`} />
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{card.label}</p>
-                <p className="mt-2 text-2xl font-bold text-slate-900">{card.value}</p>
-                <p className="mt-1 text-xs text-slate-500">{card.hint}</p>
+        ].map((card) => {
+          const visibilityMap: Record<string, string> = {
+            'Active Jobs': 'job-cards-el-stat-active',
+            Pending: 'job-cards-el-stat-pending',
+            'In Progress': 'job-cards-el-stat-in-progress',
+            'Completed Today': 'job-cards-el-stat-completed-today',
+          };
+          const key = visibilityMap[card.label];
+          if (!key || !isElementVisible(key)) return null;
+
+          return (
+            <div
+              key={card.label}
+              className="group relative overflow-hidden rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md"
+            >
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleJobCardsVisibilityToggle(key, true); }}
+                  className="absolute top-2 right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                  title="Hide stat"
+                  aria-label={`Hide ${card.label}`}
+                >
+                  <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M18 6 6 18" />
+                    <path d="m6 6 12 12" />
+                  </svg>
+                </button>
+              )}
+              <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${card.accent}`} />
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{card.label}</p>
+                  <p className="mt-2 text-2xl font-bold text-slate-900">{card.value}</p>
+                  <p className="mt-1 text-xs text-slate-500">{card.hint}</p>
+                </div>
+                <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-50 text-xl">{card.icon}</span>
               </div>
-              <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-50 text-xl">{card.icon}</span>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
-      <section className="overflow-hidden rounded-3xl border border-slate-200/80 bg-white shadow-xl shadow-slate-200/50">
+      {isElementVisible('job-cards-sec-table') && (
+      <section className="relative overflow-hidden rounded-3xl border border-slate-200/80 bg-white shadow-xl shadow-slate-200/50">
+        {showWidgetCloseButtons && (
+          <button
+            type="button"
+            onClick={() => { void handleJobCardsVisibilityToggle('job-cards-sec-table', true); }}
+            className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+            title="Hide section"
+            aria-label="Hide job cards table section"
+          >
+            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M18 6 6 18" />
+              <path d="m6 6 12 12" />
+            </svg>
+          </button>
+        )}
         <div className="border-b border-slate-100 bg-gradient-to-r from-indigo-50/80 via-white to-violet-50/40 px-5 py-6 sm:px-8">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
             <div>
@@ -928,35 +1362,67 @@ export default function JobCardsPage() {
               </p>
             </div>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-              <div className="relative">
-                <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400">⌕</span>
-                <input
-                  type="search"
-                  value={listSearch}
-                  onChange={(e) => setListSearch(e.target.value)}
-                  placeholder="Search vehicle no, chassis, customer..."
-                  className="w-full rounded-xl border border-slate-200 bg-white py-2.5 pl-10 pr-4 text-sm text-slate-900 shadow-sm placeholder:text-slate-400 focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100 focus:outline-none sm:w-72"
-                />
-              </div>
-              <div className="flex flex-wrap gap-1.5 rounded-xl border border-slate-200 bg-slate-50/80 p-1">
-                {filterPills.map((pill) => (
-                  <button
-                    key={pill.value}
-                    type="button"
-                    onClick={() => {
-                      setListFilter(pill.value);
-                      setCurrentPage(1);
-                    }}
-                    className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
-                      listFilter === pill.value
-                        ? 'bg-white text-indigo-700 shadow-sm ring-1 ring-indigo-200'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    {pill.label}
-                  </button>
-                ))}
-              </div>
+              {isElementVisible('job-cards-el-search') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleJobCardsVisibilityToggle('job-cards-el-search', true); }}
+                      className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide search"
+                      aria-label="Hide search"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400">⌕</span>
+                  <input
+                    type="search"
+                    value={listSearch}
+                    onChange={(e) => setListSearch(e.target.value)}
+                    placeholder="Search vehicle no, chassis, customer..."
+                    className="w-full rounded-xl border border-slate-200 bg-white py-2.5 pl-10 pr-4 text-sm text-slate-900 shadow-sm placeholder:text-slate-400 focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100 focus:outline-none sm:w-72"
+                  />
+                </div>
+              )}
+              {isElementVisible('job-cards-el-filter-pills') && (
+                <div className="relative flex flex-wrap gap-1.5 rounded-xl border border-slate-200 bg-slate-50/80 p-1">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleJobCardsVisibilityToggle('job-cards-el-filter-pills', true); }}
+                      className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide filters"
+                      aria-label="Hide filters"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  {filterPills.map((pill) => (
+                    <button
+                      key={pill.value}
+                      type="button"
+                      onClick={() => {
+                        setListFilter(pill.value);
+                        setCurrentPage(1);
+                      }}
+                      className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
+                        listFilter === pill.value
+                          ? 'bg-white text-indigo-700 shadow-sm ring-1 ring-indigo-200'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {pill.label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -965,30 +1431,230 @@ export default function JobCardsPage() {
           <table className="min-w-full">
             <thead>
               <tr className="bg-slate-900 text-left text-xs font-semibold uppercase tracking-wider text-slate-300">
-                <th className="px-5 py-3.5">Job Card</th>
-                <th className="px-5 py-3.5">Customer</th>
-                <th className="px-5 py-3.5">Vehicle</th>
-                <th className="px-5 py-3.5">Problem</th>
-                <th className="px-5 py-3.5">Technician</th>
-                <th className="px-5 py-3.5">Inspection</th>
-                <th className="px-5 py-3.5">Received</th>
-                <th className="px-5 py-3.5">Est. Cost</th>
-                <th className="px-5 py-3.5">Status</th>
-                <th className="px-5 py-3.5"></th>
+                {isColumnVisible('job-cards-col-job-card') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center gap-2">
+                      <span>Job Card</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleJobCardsVisibilityToggle('job-cards-col-job-card', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Job Card column"
+                          aria-label="Hide Job Card column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('job-cards-col-customer') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center gap-2">
+                      <span>Customer</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleJobCardsVisibilityToggle('job-cards-col-customer', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Customer column"
+                          aria-label="Hide Customer column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('job-cards-col-vehicle') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center gap-2">
+                      <span>Vehicle</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleJobCardsVisibilityToggle('job-cards-col-vehicle', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Vehicle column"
+                          aria-label="Hide Vehicle column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('job-cards-col-problem') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center gap-2">
+                      <span>Problem</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleJobCardsVisibilityToggle('job-cards-col-problem', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Problem column"
+                          aria-label="Hide Problem column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('job-cards-col-technician') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center gap-2">
+                      <span>Technician</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleJobCardsVisibilityToggle('job-cards-col-technician', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Technician column"
+                          aria-label="Hide Technician column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('job-cards-col-inspection') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center gap-2">
+                      <span>Inspection</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleJobCardsVisibilityToggle('job-cards-col-inspection', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Inspection column"
+                          aria-label="Hide Inspection column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('job-cards-col-received') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center gap-2">
+                      <span>Received</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleJobCardsVisibilityToggle('job-cards-col-received', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Received column"
+                          aria-label="Hide Received column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('job-cards-col-est-cost') && (
+                  <th className="px-5 py-3.5 text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      <span>Est. Cost</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleJobCardsVisibilityToggle('job-cards-col-est-cost', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Est. Cost column"
+                          aria-label="Hide Est. Cost column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('job-cards-col-status') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center gap-2">
+                      <span>Status</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleJobCardsVisibilityToggle('job-cards-col-status', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Status column"
+                          aria-label="Hide Status column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('job-cards-col-actions') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center justify-end gap-2">
+                      <span>Actions</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleJobCardsVisibilityToggle('job-cards-col-actions', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Actions column"
+                          aria-label="Hide Actions column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {listLoading ? (
                 Array.from({ length: 5 }).map((_, i) => (
                   <tr key={i} className="animate-pulse">
-                    <td colSpan={10} className="px-5 py-4">
+                    <td colSpan={Math.max(visibleJobCardColumnCount, 1)} className="px-5 py-4">
                       <div className="h-4 rounded-lg bg-slate-100" />
                     </td>
                   </tr>
                 ))
               ) : records.length === 0 ? (
                 <tr>
-                  <td colSpan={10} className="px-5 py-16 text-center">
+                  <td colSpan={Math.max(visibleJobCardColumnCount, 1)} className="px-5 py-16 text-center">
                     <div className="mx-auto max-w-sm">
                       <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-100 to-violet-100 text-3xl">
                         🔧
@@ -1022,121 +1688,155 @@ export default function JobCardsPage() {
                       key={job.id}
                       className={`transition-colors hover:bg-indigo-50/40 ${index % 2 === 0 ? 'bg-white' : 'bg-slate-50/50'}`}
                     >
-                      <td className="px-5 py-4">
-                        <p className="font-mono text-sm font-bold text-indigo-700">{job.job_card_number}</p>
-                        <p className={`mt-0.5 text-xs font-semibold capitalize ${priorityBadge(job.priority)}`}>
-                          {job.priority} priority
-                        </p>
-                      </td>
-                      <td className="px-5 py-4">
-                        <div className="flex items-center gap-2.5">
-                          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 text-xs font-bold text-white">
-                            {initial}
-                          </span>
-                          <div>
-                            <p className="text-sm font-medium text-slate-800">{job.customer_name}</p>
-                            <p className="text-xs text-slate-500">{job.customer_phone}</p>
-                          </div>
-                        </div>
-                      </td>
-                      <td className="px-5 py-4 text-sm text-slate-600">
-                        {job.vehicle_no && (
-                          <p className="font-mono text-sm font-bold text-slate-800">{job.vehicle_no}</p>
-                        )}
-                        <p className={job.vehicle_no ? 'mt-0.5 text-slate-600' : ''}>{vehicleLabel}</p>
-                        {job.chassis_no && (
-                          <p className="mt-0.5 font-mono text-xs text-slate-400">Chassis: {job.chassis_no}</p>
-                        )}
-                        {!job.vehicle_no && !job.chassis_no && vehicleLabel === '—' && (
-                          <span className="text-slate-400">—</span>
-                        )}
-                      </td>
-                      <td className="max-w-[200px] px-5 py-4">
-                        <p className="line-clamp-2 text-sm text-slate-600" title={job.problem_description}>
-                          {job.problem_description}
-                        </p>
-                      </td>
-                      <td className="px-5 py-4">
-                        <select
-                          value={job.assigned_employee_id || ''}
-                          disabled={updatingId === job.id}
-                          onChange={(e) =>
-                            handleTechnicianChange(job, e.target.value ? Number(e.target.value) : '')
-                          }
-                          className="w-full min-w-[130px] rounded-lg border border-slate-200 bg-white py-1.5 pl-2 pr-6 text-xs font-medium text-slate-800 shadow-sm focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
-                        >
-                          <option value="">Assign technician...</option>
-                          {employees.map((emp) => (
-                            <option key={emp.id} value={emp.id}>
-                              {employeeName(emp)}
-                            </option>
-                          ))}
-                        </select>
-                      </td>
-                      <td className="px-5 py-4">
-                        {job.inspection_review ? (
-                          <div>
-                            <span className="inline-flex rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-emerald-700 ring-1 ring-emerald-500/25">
-                              Reviewed
+                      {isColumnVisible('job-cards-col-job-card') && (
+                        <td className="px-5 py-4">
+                          <p className="font-mono text-sm font-bold text-indigo-700">{job.job_card_number}</p>
+                          <p className={`mt-0.5 text-xs font-semibold capitalize ${priorityBadge(job.priority)}`}>
+                            {job.priority} priority
+                          </p>
+                        </td>
+                      )}
+                      {isColumnVisible('job-cards-col-customer') && (
+                        <td className="px-5 py-4">
+                          <div className="flex items-center gap-2.5">
+                            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 text-xs font-bold text-white">
+                              {initial}
                             </span>
-                            <p className="mt-1 line-clamp-2 text-xs text-slate-600" title={job.inspection_review}>
-                              {job.inspection_review}
-                            </p>
+                            <div>
+                              <p className="text-sm font-medium text-slate-800">{job.customer_name}</p>
+                              <p className="text-xs text-slate-500">{job.customer_phone}</p>
+                            </div>
                           </div>
-                        ) : (
-                          <span className="text-xs font-medium text-amber-700">Pending review</span>
-                        )}
-                      </td>
-                      <td className="px-5 py-4 text-sm text-slate-600">{received}</td>
-                      <td className="px-5 py-4 text-right text-sm font-semibold text-slate-900">
-                        {job.estimated_cost != null ? money(Number(job.estimated_cost)) : '—'}
-                      </td>
-                      <td className="px-5 py-4">
-                        <select
-                          value={job.status}
-                          disabled={updatingId === job.id}
-                          onChange={(e) => handleStatusChange(job, e.target.value as JobStatus)}
-                          className={`rounded-lg border-0 py-1.5 pl-2 pr-7 text-xs font-semibold capitalize ring-1 ring-inset focus:ring-2 focus:ring-indigo-300 ${statusBadge(job.status)}`}
-                        >
-                          {STATUS_OPTIONS.map((opt) => (
-                            <option key={opt.value} value={opt.value}>
-                              {opt.label}
-                            </option>
-                          ))}
-                        </select>
-                      </td>
-                      <td className="px-5 py-4">
-                        <div className="flex min-w-[148px] flex-col gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => handleOpenReview(job)}
-                            className="whitespace-nowrap rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-indigo-500"
+                        </td>
+                      )}
+                      {isColumnVisible('job-cards-col-vehicle') && (
+                        <td className="px-5 py-4 text-sm text-slate-600">
+                          {job.vehicle_no && (
+                            <p className="font-mono text-sm font-bold text-slate-800">{job.vehicle_no}</p>
+                          )}
+                          <p className={job.vehicle_no ? 'mt-0.5 text-slate-600' : ''}>{vehicleLabel}</p>
+                          {job.chassis_no && (
+                            <p className="mt-0.5 font-mono text-xs text-slate-400">Chassis: {job.chassis_no}</p>
+                          )}
+                          {!job.vehicle_no && !job.chassis_no && vehicleLabel === '—' && (
+                            <span className="text-slate-400">—</span>
+                          )}
+                        </td>
+                      )}
+                      {isColumnVisible('job-cards-col-problem') && (
+                        <td className="max-w-[200px] px-5 py-4">
+                          <p className="line-clamp-2 text-sm text-slate-600" title={job.problem_description}>
+                            {job.problem_description}
+                          </p>
+                        </td>
+                      )}
+                      {isColumnVisible('job-cards-col-technician') && (
+                        <td className="px-5 py-4">
+                          <select
+                            value={job.assigned_employee_id || ''}
+                            disabled={updatingId === job.id}
+                            onChange={(e) =>
+                              handleTechnicianChange(job, e.target.value ? Number(e.target.value) : '')
+                            }
+                            className="w-full min-w-[130px] rounded-lg border border-slate-200 bg-white py-1.5 pl-2 pr-6 text-xs font-medium text-slate-800 shadow-sm focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
                           >
-                            {job.inspection_review ? 'Edit Review' : 'Add Review'}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleOpenDocument(job, 'quotation')}
-                            className="whitespace-nowrap rounded-lg border border-violet-200 bg-violet-50 px-3 py-1.5 text-xs font-semibold text-violet-800 hover:bg-violet-100"
+                            <option value="">Assign technician...</option>
+                            {employees.map((emp) => (
+                              <option key={emp.id} value={emp.id}>
+                                {employeeName(emp)}
+                              </option>
+                            ))}
+                          </select>
+                        </td>
+                      )}
+                      {isColumnVisible('job-cards-col-inspection') && (
+                        <td className="px-5 py-4">
+                          {job.inspection_review ? (
+                            <div>
+                              <span className="inline-flex rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-emerald-700 ring-1 ring-emerald-500/25">
+                                Reviewed
+                              </span>
+                              <p className="mt-1 line-clamp-2 text-xs text-slate-600" title={job.inspection_review}>
+                                {job.inspection_review}
+                              </p>
+                            </div>
+                          ) : (
+                            <span className="text-xs font-medium text-amber-700">Pending review</span>
+                          )}
+                        </td>
+                      )}
+                      {isColumnVisible('job-cards-col-received') && (
+                        <td className="px-5 py-4 text-sm text-slate-600">{received}</td>
+                      )}
+                      {isColumnVisible('job-cards-col-est-cost') && (
+                        <td className="px-5 py-4 text-right text-sm font-semibold text-slate-900">
+                          {job.estimated_cost != null ? money(Number(job.estimated_cost)) : '—'}
+                        </td>
+                      )}
+                      {isColumnVisible('job-cards-col-status') && (
+                        <td className="px-5 py-4">
+                          <select
+                            value={job.status}
+                            disabled={updatingId === job.id}
+                            onChange={(e) => handleStatusChange(job, e.target.value as JobStatus)}
+                            className={`rounded-lg border-0 py-1.5 pl-2 pr-7 text-xs font-semibold capitalize ring-1 ring-inset focus:ring-2 focus:ring-indigo-300 ${statusBadge(job.status)}`}
                           >
-                            Make Quotation
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleOpenDocument(job, 'invoice')}
-                            className="whitespace-nowrap rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
-                          >
-                            Make Invoice
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleOpenViewDocuments(job)}
-                            className="whitespace-nowrap rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
-                          >
-                            View QT / Invoice
-                          </button>
-                        </div>
-                      </td>
+                            {STATUS_OPTIONS.map((opt) => (
+                              <option key={opt.value} value={opt.value}>
+                                {opt.label}
+                              </option>
+                            ))}
+                          </select>
+                        </td>
+                      )}
+                      {isColumnVisible('job-cards-col-actions') && (
+                        <td className="px-5 py-4">
+                          <div className="flex min-w-[148px] flex-col gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => { void handleOpenViewJob(job); }}
+                              className="whitespace-nowrap rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs font-semibold text-blue-800 hover:bg-blue-100"
+                            >
+                              View Job Card
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleOpenEdit(job)}
+                              className="whitespace-nowrap rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-800 hover:bg-amber-100"
+                            >
+                              Edit Job Card
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleOpenReview(job)}
+                              className="whitespace-nowrap rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-indigo-500"
+                            >
+                              {job.inspection_review ? 'Edit Review' : 'Add Review'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleOpenDocument(job, 'quotation')}
+                              className="whitespace-nowrap rounded-lg border border-violet-200 bg-violet-50 px-3 py-1.5 text-xs font-semibold text-violet-800 hover:bg-violet-100"
+                            >
+                              Make Quotation
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleOpenDocument(job, 'invoice')}
+                              className="whitespace-nowrap rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
+                            >
+                              Make Invoice
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleOpenViewDocuments(job)}
+                              className="whitespace-nowrap rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                            >
+                              View QT / Invoice
+                            </button>
+                          </div>
+                        </td>
+                      )}
                     </tr>
                   );
                 })
@@ -1145,6 +1845,7 @@ export default function JobCardsPage() {
           </table>
         </div>
 
+        {isElementVisible('job-cards-sec-pagination') && (
         <div className="flex flex-col gap-4 border-t border-slate-100 bg-slate-50/60 px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-8">
           <p className="text-sm text-slate-600">
             Showing <span className="font-semibold text-slate-900">{records.length}</span> of{' '}
@@ -1172,7 +1873,9 @@ export default function JobCardsPage() {
             </button>
           </div>
         </div>
+        )}
       </section>
+      )}
 
       {showCreateModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-3 backdrop-blur-md sm:p-4">
@@ -1180,13 +1883,17 @@ export default function JobCardsPage() {
             <div className="relative shrink-0 overflow-hidden border-b border-indigo-100/80 bg-gradient-to-r from-indigo-950 via-violet-950 to-purple-900 px-6 py-5 sm:px-8">
               <div className="relative flex items-start justify-between gap-4">
                 <div>
-                  <p className="text-xs font-semibold uppercase tracking-widest text-indigo-200/80">New job</p>
-                  <h3 className="mt-1 text-2xl font-bold text-white">Create Job Card</h3>
+                  <p className="text-xs font-semibold uppercase tracking-widest text-indigo-200/80">
+                    {editingJobId ? 'Edit job' : 'New job'}
+                  </p>
+                  <h3 className="mt-1 text-2xl font-bold text-white">
+                    {editingJobId ? 'Edit Job Card' : 'Create Job Card'}
+                  </h3>
                   <p className="mt-1 text-sm text-indigo-100/80">Customer & vehicle details for service tracking</p>
                 </div>
                 <button
                   type="button"
-                  onClick={() => setShowCreateModal(false)}
+                  onClick={handleCloseCreateModal}
                   className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-white/20 bg-white/10 text-lg text-white hover:bg-white/20"
                 >
                   ×
@@ -1287,6 +1994,25 @@ export default function JobCardsPage() {
                       placeholder="Describe the issue reported by customer..."
                     />
                   </div>
+                  <div className="rounded-xl border border-fuchsia-200 bg-fuchsia-50/60 p-3">
+                    <label className={labelClass}>Quick Upload Job Images</label>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      onChange={(e) => {
+                        void handleSelectImages(e.target.files);
+                        e.currentTarget.value = '';
+                      }}
+                      disabled={compressingImages || saving}
+                      className="block w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-700 file:mr-3 file:rounded-lg file:border-0 file:bg-fuchsia-100 file:px-3 file:py-2 file:text-xs file:font-semibold file:text-fuchsia-700 hover:file:bg-fuchsia-200"
+                    />
+                    <p className="mt-1.5 text-xs text-slate-600">
+                      {pendingImages.length > 0
+                        ? `${pendingImages.length} image${pendingImages.length > 1 ? 's' : ''} selected. Scroll down to preview/remove.`
+                        : 'You can select up to 8 images. Images are auto-compressed before upload.'}
+                    </p>
+                  </div>
                   <div>
                     <label className={labelClass}>Accessories Received</label>
                     <input
@@ -1358,26 +2084,121 @@ export default function JobCardsPage() {
                   </div>
                 </div>
                 <div className="p-5">
-                  <label className={labelClass}>Technician for this job</label>
-                  <select
-                    value={assignedEmployeeId}
-                    onChange={(e) => {
-                      const id = e.target.value ? Number(e.target.value) : '';
-                      setAssignedEmployeeId(id);
-                      if (id && !inspectedByEmployeeId) setInspectedByEmployeeId(id);
-                    }}
-                    className={fieldClass}
-                  >
-                    <option value="">Select technician...</option>
-                    {employees.map((emp) => (
-                      <option key={emp.id} value={emp.id}>
-                        {employeeName(emp)}
-                        {emp.employee_code ? ` (${emp.employee_code})` : ''}
-                      </option>
-                    ))}
-                  </select>
-                  {!assignedEmployeeId && (
+                  <label className={labelClass}>Technicians for this job</label>
+                  <div className="grid grid-cols-1 gap-2 rounded-xl border border-slate-200 bg-white p-3 sm:grid-cols-2">
+                    {employees.map((emp) => {
+                      const checked = assignedEmployeeIds.includes(emp.id);
+                      return (
+                        <label
+                          key={emp.id}
+                          className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-sm transition ${
+                            checked
+                              ? 'border-indigo-300 bg-indigo-50 text-indigo-900'
+                              : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300'
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) => {
+                              const isChecked = e.target.checked;
+                              setAssignedEmployeeIds((prev) => {
+                                if (isChecked) {
+                                  const next = Array.from(new Set([...prev, emp.id]));
+                                  if (!inspectedByEmployeeId) setInspectedByEmployeeId(next[0] || '');
+                                  return next;
+                                }
+
+                                const next = prev.filter((id) => id !== emp.id);
+                                if (inspectedByEmployeeId === emp.id) {
+                                  setInspectedByEmployeeId(next[0] || '');
+                                }
+                                return next;
+                              });
+                            }}
+                            className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                          />
+                          <span>
+                            {employeeName(emp)}
+                            {emp.employee_code ? ` (${emp.employee_code})` : ''}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  {assignedEmployeeIds.length > 0 && (
+                    <p className="mt-2 text-xs text-slate-600">
+                      Selected {assignedEmployeeIds.length} technician{assignedEmployeeIds.length > 1 ? 's' : ''}.
+                    </p>
+                  )}
+                  {assignedEmployeeIds.length === 0 && (
                     <p className="mt-2 text-xs text-amber-700">You can assign now or later from the job list.</p>
+                  )}
+                </div>
+              </div>
+
+              <div className="overflow-hidden rounded-2xl border border-fuchsia-200/80 bg-gradient-to-br from-fuchsia-50/90 via-white to-pink-50/50 shadow-sm">
+                <div className="flex items-center gap-3 border-b border-fuchsia-100/80 bg-fuchsia-950/5 px-5 py-3.5">
+                  <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-fuchsia-600 to-pink-600 text-lg text-white shadow-md">
+                    📸
+                  </span>
+                  <div>
+                    <h4 className="text-sm font-bold uppercase tracking-wider text-slate-800">Job Images</h4>
+                    <p className="text-xs text-slate-500">Upload issue photos. Files are auto-compressed before upload.</p>
+                  </div>
+                </div>
+                <div className="space-y-4 p-5">
+                  <div>
+                    <label className={labelClass}>Upload Images (max 8)</label>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      onChange={(e) => {
+                        void handleSelectImages(e.target.files);
+                        e.currentTarget.value = '';
+                      }}
+                      disabled={compressingImages || saving}
+                      className="block w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-700 file:mr-3 file:rounded-lg file:border-0 file:bg-fuchsia-100 file:px-3 file:py-2 file:text-xs file:font-semibold file:text-fuchsia-700 hover:file:bg-fuchsia-200"
+                    />
+                    <p className="mt-1.5 text-xs text-slate-500">Each image is compressed to about 0.8MB with max 1600px dimension.</p>
+                  </div>
+
+                  {compressingImages && (
+                    <div className="rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs font-medium text-indigo-700">
+                      Compressing images...
+                    </div>
+                  )}
+
+                  {imageUploadError && (
+                    <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+                      {imageUploadError}
+                    </div>
+                  )}
+
+                  {pendingImages.length > 0 && (
+                    <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                      {pendingImages.map((item, index) => (
+                        <div key={`${item.file.name}-${index}`} className="relative overflow-hidden rounded-xl border border-slate-200 bg-white">
+                          <img src={item.previewUrl} alt={`Upload preview ${index + 1}`} className="h-24 w-full object-cover" />
+                          <button
+                            type="button"
+                            onClick={() => removePendingImage(index)}
+                            className="absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded-full bg-black/60 text-xs text-white hover:bg-black/75"
+                            aria-label="Remove image"
+                            title="Remove image"
+                          >
+                            ×
+                          </button>
+                          <div className="space-y-0.5 px-2 py-1.5 text-[10px] text-slate-600">
+                            <p className="truncate font-medium text-slate-700">{item.file.name}</p>
+                            <p>
+                              {formatFileSize(item.originalSize)} to {formatFileSize(item.file.size)}
+                            </p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   )}
                 </div>
               </div>
@@ -1442,8 +2263,8 @@ export default function JobCardsPage() {
             <div className="flex shrink-0 justify-end gap-3 border-t border-slate-200 bg-white px-5 py-4 sm:px-8">
               <button
                 type="button"
-                onClick={() => setShowCreateModal(false)}
-                disabled={saving}
+                onClick={handleCloseCreateModal}
+                disabled={saving || compressingImages}
                 className="rounded-xl border border-slate-200 px-5 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
               >
                 Cancel
@@ -1451,7 +2272,7 @@ export default function JobCardsPage() {
               <button
                 type="button"
                 onClick={handleSave}
-                disabled={saving}
+                disabled={saving || compressingImages}
                 className="inline-flex min-w-[140px] items-center justify-center rounded-xl bg-gradient-to-r from-indigo-600 to-violet-600 px-6 py-2.5 text-sm font-bold text-white shadow-lg disabled:opacity-60"
               >
                 {saving ? (
@@ -1460,8 +2281,183 @@ export default function JobCardsPage() {
                     Saving...
                   </span>
                 ) : (
-                  'Save Job Card'
+                  editingJobId ? 'Update Job Card' : 'Save Job Card'
                 )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showViewJobModal && viewJobDetail && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-3 backdrop-blur-md sm:p-4">
+          <div className="flex max-h-[94vh] w-full max-w-4xl flex-col overflow-hidden rounded-3xl border border-white/10 bg-white shadow-2xl">
+            <div className="shrink-0 border-b border-blue-100 bg-gradient-to-r from-blue-900 to-indigo-900 px-6 py-5 sm:px-8">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-widest text-blue-200/90">Job Card Details</p>
+                  <h3 className="mt-1 text-2xl font-bold text-white">{viewJobDetail.job_card_number}</h3>
+                  <p className="mt-1 text-sm text-blue-100/90">
+                    {viewJobDetail.customer_name}
+                    {viewJobDetail.vehicle_no ? ` · ${viewJobDetail.vehicle_no}` : ''}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowViewJobModal(false);
+                    setViewJobDetail(null);
+                  }}
+                  className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-white/20 bg-white/10 text-lg text-white"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto space-y-5 bg-slate-50/60 p-5 sm:p-7">
+              {viewJobLoading && (
+                <div className="rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-800">
+                  Loading full job card details...
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Customer</p>
+                  <p className="mt-2 text-sm font-semibold text-slate-900">{viewJobDetail.customer_name || '—'}</p>
+                  <p className="mt-1 text-sm text-slate-700">Phone: {viewJobDetail.customer_phone || '—'}</p>
+                  <p className="mt-1 text-sm text-slate-700">Email: {viewJobDetail.customer_email || '—'}</p>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Vehicle</p>
+                  <p className="mt-2 text-sm text-slate-700">No: {viewJobDetail.vehicle_no || '—'}</p>
+                  <p className="mt-1 text-sm text-slate-700">Brand / Model: {[viewJobDetail.brand, viewJobDetail.model].filter(Boolean).join(' / ') || '—'}</p>
+                  <p className="mt-1 text-sm text-slate-700">Chassis: {viewJobDetail.chassis_no || '—'}</p>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Problem Description</p>
+                <p className="mt-2 whitespace-pre-wrap text-sm text-slate-800">{viewJobDetail.problem_description || '—'}</p>
+                <p className="mt-3 text-xs font-semibold uppercase tracking-wider text-slate-500">Accessories Received</p>
+                <p className="mt-1 whitespace-pre-wrap text-sm text-slate-700">{viewJobDetail.accessories_received || '—'}</p>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Assignment</p>
+                  <p className="mt-2 text-sm text-slate-700">
+                    Technicians:{' '}
+                    {viewJobDetail.assigned_employees && viewJobDetail.assigned_employees.length > 0
+                      ? viewJobDetail.assigned_employees.map((emp) => employeeName(emp)).join(', ')
+                      : employeeName(viewJobDetail.assigned_employee)}
+                  </p>
+                  <p className="mt-1 text-sm text-slate-700">Inspector: {employeeName(viewJobDetail.inspected_by_employee)}</p>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Status & Priority</p>
+                  <p className="mt-2 text-sm text-slate-700">Status: <span className="font-semibold capitalize">{viewJobDetail.status || '—'}</span></p>
+                  <p className="mt-1 text-sm text-slate-700">Priority: <span className="font-semibold capitalize">{viewJobDetail.priority || '—'}</span></p>
+                  <p className="mt-1 text-sm text-slate-700">Received: {fmtDocDate(viewJobDetail.received_date)}</p>
+                  <p className="mt-1 text-sm text-slate-700">Promised: {fmtDocDate(viewJobDetail.promised_date)}</p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                <div className="rounded-2xl border border-slate-200 bg-white p-4 text-sm shadow-sm">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Estimated Cost</p>
+                  <p className="mt-2 font-bold text-slate-900">LKR {money(Number(viewJobDetail.estimated_cost || 0))}</p>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-white p-4 text-sm shadow-sm">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Advance Amount</p>
+                  <p className="mt-2 font-bold text-slate-900">LKR {money(Number(viewJobDetail.advance_amount || 0))}</p>
+                </div>
+                <div className="rounded-2xl border border-slate-200 bg-white p-4 text-sm shadow-sm">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Created</p>
+                  <p className="mt-2 font-medium text-slate-800">{fmtDateTime(viewJobDetail.created_at)}</p>
+                  <p className="mt-1 text-xs text-slate-500">By: {viewJobDetail.creator?.name || viewJobDetail.creator?.email || '—'}</p>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Inspection Review</p>
+                <p className="mt-2 whitespace-pre-wrap text-sm text-slate-800">{viewJobDetail.inspection_review || '—'}</p>
+                <p className="mt-2 text-xs text-slate-500">Reviewed at: {fmtDateTime(viewJobDetail.inspection_reviewed_at)}</p>
+              </div>
+
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Internal Notes</p>
+                <p className="mt-2 whitespace-pre-wrap text-sm text-slate-800">{viewJobDetail.notes || '—'}</p>
+              </div>
+
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Uploaded Images</p>
+                {viewJobDetail.images && viewJobDetail.images.length > 0 ? (
+                  <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4">
+                    {viewJobDetail.images.map((img) => (
+                      <button
+                        key={img.id}
+                        type="button"
+                        onClick={() => setViewImagePreview(img)}
+                        className="group overflow-hidden rounded-xl border border-slate-200 bg-slate-50"
+                      >
+                        <img src={img.image_url} alt={img.original_name || `Job image ${img.id}`} className="h-28 w-full object-cover transition group-hover:scale-105" />
+                        <div className="px-2 py-1.5 text-[10px] text-slate-600">
+                          <p className="truncate font-medium text-slate-700">{img.original_name || `Image #${img.id}`}</p>
+                          <p>{img.size_kb ? `${img.size_kb} KB` : '—'}</p>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="mt-2 text-sm text-slate-500">No images uploaded for this job card.</p>
+                )}
+              </div>
+            </div>
+
+            <div className="flex shrink-0 justify-end gap-3 border-t border-slate-200 bg-white px-6 py-4">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowViewJobModal(false);
+                  setViewJobDetail(null);
+                  setViewImagePreview(null);
+                }}
+                className="rounded-xl border border-slate-200 px-5 py-2 text-sm font-semibold text-slate-700"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {viewImagePreview && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/85 p-4 backdrop-blur-sm">
+          <button
+            type="button"
+            aria-label="Close image preview"
+            onClick={() => setViewImagePreview(null)}
+            className="absolute right-4 top-4 inline-flex h-11 w-11 items-center justify-center rounded-full border border-white/25 bg-white/10 text-2xl font-bold text-white hover:bg-white/20"
+          >
+            ×
+          </button>
+
+          <div className="w-full max-w-5xl overflow-hidden rounded-2xl border border-white/15 bg-slate-900 shadow-2xl">
+            <img
+              src={viewImagePreview.image_url}
+              alt={viewImagePreview.original_name || `Job image ${viewImagePreview.id}`}
+              className="max-h-[80vh] w-full object-contain bg-slate-900"
+            />
+            <div className="flex items-center justify-between gap-3 bg-slate-900/95 px-4 py-3 text-sm text-slate-100">
+              <p className="truncate font-medium">{viewImagePreview.original_name || `Image #${viewImagePreview.id}`}</p>
+              <button
+                type="button"
+                onClick={() => setViewImagePreview(null)}
+                className="rounded-lg border border-white/25 px-3 py-1.5 text-xs font-semibold text-white hover:bg-white/10"
+              >
+                Close Image
               </button>
             </div>
           </div>

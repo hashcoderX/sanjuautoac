@@ -17,19 +17,64 @@ use Illuminate\Support\Facades\Validator;
 
 class CompanyController extends Controller
 {
-    public function index()
+    private function isPrivilegedAdmin(?\App\Models\User $user): bool
     {
-        $companies = Company::with(['bankAccounts', 'chequeAccounts'])->get();
+        if (!$user) {
+            return false;
+        }
+
+        $user->loadMissing('roles');
+
+        $roleNames = $user->roles
+            ->pluck('name')
+            ->push((string) ($user->role ?? ''))
+            ->map(fn ($name) => strtolower(trim((string) $name)))
+            ->filter();
+
+        return $roleNames->contains(function ($roleName) {
+            return str_contains($roleName, 'super admin')
+                || str_contains($roleName, 'superadmin')
+                || str_contains($roleName, 'administrator');
+        });
+    }
+
+    public function index(Request $request)
+    {
+        $query = Company::with(['bankAccounts', 'chequeAccounts']);
+
+        $user = $request->user();
+        if (!$this->isPrivilegedAdmin($user)) {
+            $tenantId = (int) ($user?->employee?->tenant_id ?? $user?->branch_id ?? 0);
+            if ($tenantId > 0) {
+                $query->where('id', $tenantId);
+            } else {
+                $query->whereRaw('1 = 0');
+            }
+        }
+
+        $companies = $query->get();
         return response()->json($companies);
     }
 
-    public function show(Company $company)
+    public function show(Request $request, Company $company)
     {
+        $user = $request->user();
+        if (!$this->isPrivilegedAdmin($user)) {
+            $tenantId = (int) ($user?->employee?->tenant_id ?? $user?->branch_id ?? 0);
+            if ($tenantId <= 0 || $company->id !== $tenantId) {
+                return response()->json(['message' => 'Unauthorized company access.'], 403);
+            }
+        }
+
         return response()->json($company->load(['bankAccounts', 'chequeAccounts']));
     }
 
     public function store(Request $request)
     {
+        if (!$this->isPrivilegedAdmin($request->user())) {
+            return response()->json(['message' => 'Only privileged admin users can create companies.'], 403);
+        }
+
         $request->validate([
             'name' => 'required|string|max:255',
             'email' => 'required|string|email|max:255|unique:companies',
@@ -126,6 +171,14 @@ class CompanyController extends Controller
 
     public function update(Request $request, Company $company)
     {
+        $user = $request->user();
+        if (!$this->isPrivilegedAdmin($user)) {
+            $tenantId = (int) ($user?->employee?->tenant_id ?? $user?->branch_id ?? 0);
+            if ($tenantId <= 0 || $company->id !== $tenantId) {
+                return response()->json(['message' => 'Unauthorized company access.'], 403);
+            }
+        }
+
         $request->validate([
             'name' => 'required|string|max:255',
             'email' => 'required|string|email|max:255|unique:companies,email,' . $company->id,
@@ -274,8 +327,12 @@ class CompanyController extends Controller
         return $validatedRows;
     }
 
-    public function destroy(Company $company)
+    public function destroy(Request $request, Company $company)
     {
+        if (!$this->isPrivilegedAdmin($request->user())) {
+            return response()->json(['message' => 'Only privileged admin users can delete companies.'], 403);
+        }
+
         // Check if company is referenced in other tables
         $hasEmployees = Employee::where('tenant_id', $company->id)->orWhere('branch_id', $company->id)->exists();
         $hasCandidates = Candidate::where('tenant_id', $company->id)->orWhere('branch_id', $company->id)->exists();

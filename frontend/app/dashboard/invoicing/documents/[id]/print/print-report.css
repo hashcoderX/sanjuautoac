@@ -93,12 +93,41 @@
 }
 
 .print-sheet {
+  position: relative;
   width: 100%;
   max-width: var(--print-width);
   background: #fff;
   padding: var(--print-pad);
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.12);
   box-sizing: border-box;
+}
+
+.widget-block {
+  position: relative;
+}
+
+.widget-close-btn {
+  position: absolute;
+  top: -0.4rem;
+  right: -0.4rem;
+  z-index: 25;
+  width: 1.4rem;
+  height: 1.4rem;
+  border-radius: 9999px;
+  border: 1px solid #fecaca;
+  background: #ffe4e6;
+  color: #be123c;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: system-ui, sans-serif;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.widget-close-btn:hover {
+  background: #fecdd3;
 }
 
 .rpt-company-name {
@@ -185,6 +214,7 @@
   font-weight: 700;
   text-align: left;
   background: #fff;
+  position: relative;
 }
 
 .rpt-items .num {
@@ -285,6 +315,10 @@
 @media print {
   .print-root {
     background: #fff !important;
+  }
+
+  .widget-close-btn {
+    display: none !important;
   }
 
   .print-toolbar {

@@ -2,9 +2,9 @@ import type { MetadataRoute } from "next";
 
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "BMS ERP",
-    short_name: "BMS",
-    description: "Business Management System with HRM, payroll, and operations.",
+    name: "ServiceOS",
+    short_name: "SO",
+    description: "ServiceOS - Business Management System with HRM, payroll, and operations.",
     start_url: "/",
     display: "standalone",
     background_color: "#ffffff",

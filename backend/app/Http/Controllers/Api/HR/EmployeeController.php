@@ -124,7 +124,7 @@ class EmployeeController extends Controller
      */
     public function index(Request $request): JsonResponse
     {
-        $query = Employee::with(['department', 'designation', 'branch', 'user:id,employee_id,role,email,name']);
+        $query = Employee::with(['department', 'designation', 'branch', 'reportingPerson:id,first_name,last_name,employee_code', 'user:id,employee_id,role,email,name']);
 
         // Filter by authenticated user's tenant/branch if available
         $user = $request->user();
@@ -192,6 +192,10 @@ class EmployeeController extends Controller
             'status' => $validated['status'] ?? 'active',
         ];
 
+        if (array_key_exists('reporting_person_id', $validated)) {
+            $employeeData['reporting_person_id'] = $validated['reporting_person_id'] ? (int) $validated['reporting_person_id'] : null;
+        }
+
         // Generate employee code
         $lastEmployee = Employee::orderBy('id', 'desc')->first();
         $nextNumber = $lastEmployee ? intval(substr($lastEmployee->employee_code, -4)) + 1 : 1;
@@ -216,7 +220,7 @@ class EmployeeController extends Controller
         $role = $this->resolveRoleFromName($userRole);
         $this->syncUserRole($employeeUser, $role, $request->user()?->id);
 
-        return response()->json($employee->load(['department', 'designation', 'branch', 'user:id,employee_id,role,email,name']), 201);
+        return response()->json($employee->load(['department', 'designation', 'branch', 'reportingPerson:id,first_name,last_name,employee_code', 'user:id,employee_id,role,email,name']), 201);
     }
 
     /**
@@ -224,7 +228,7 @@ class EmployeeController extends Controller
      */
     public function show(Employee $employee): JsonResponse
     {
-        return response()->json($employee->load(['department', 'designation', 'branch', 'user:id,employee_id,role,email,name']));
+        return response()->json($employee->load(['department', 'designation', 'branch', 'reportingPerson:id,first_name,last_name,employee_code', 'user:id,employee_id,role,email,name']));
     }
 
     /**
@@ -255,9 +259,14 @@ class EmployeeController extends Controller
             'department_id' => 'sometimes|required|exists:departments,id',
             'designation_id' => 'nullable|required_without:designation_name|exists:designations,id',
             'designation_name' => 'nullable|required_without:designation_id|string|max:255',
+            'reporting_person_id' => 'nullable|exists:employees,id',
             'branch_id' => 'sometimes|required|exists:companies,id',
             'status' => 'in:active,inactive',
         ]);
+
+        if (isset($validated['reporting_person_id']) && (int) $validated['reporting_person_id'] === (int) $employee->id) {
+            return response()->json(['message' => 'Employee cannot report to themselves.'], 422);
+        }
 
         $targetBranchId = isset($validated['branch_id']) ? (int) $validated['branch_id'] : (int) $employee->branch_id;
         $designationId = $this->resolveDesignationId(
@@ -305,6 +314,12 @@ class EmployeeController extends Controller
             'status' => $validated['status'] ?? $employee->status,
         ];
 
+        if (array_key_exists('reporting_person_id', $validated)) {
+            $updateData['reporting_person_id'] = $validated['reporting_person_id']
+                ? (int) $validated['reporting_person_id']
+                : null;
+        }
+
         $employee->update($updateData);
 
         // Keep linked user role in sync with designation
@@ -317,7 +332,7 @@ class EmployeeController extends Controller
             $this->syncUserRole($employeeUser, $role, $request->user()?->id);
         }
 
-        return response()->json($employee->load(['department', 'designation', 'branch', 'user:id,employee_id,role,email,name']));
+        return response()->json($employee->load(['department', 'designation', 'branch', 'reportingPerson:id,first_name,last_name,employee_code', 'user:id,employee_id,role,email,name']));
     }
 
     /**

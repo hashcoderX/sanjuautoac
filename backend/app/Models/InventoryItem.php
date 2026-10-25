@@ -8,6 +8,8 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 class InventoryItem extends Model
 {
     protected $fillable = [
+        'tenant_id',
+        'branch_id',
         'name',
         'code',
         'description',

@@ -5,10 +5,13 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Support\Facades\Schema;
 
 class GoodsReceivedNote extends Model
 {
     protected $fillable = [
+        'tenant_id',
+        'branch_id',
         'grn_number',
         'purchase_order_id',
         'received_date',
@@ -21,6 +24,7 @@ class GoodsReceivedNote extends Model
         'payment_timing',
         'payment_type',
         'payment_reference',
+        'payment_breakdown',
         'paid_amount',
         'paid_at',
         'payment_note',
@@ -33,6 +37,7 @@ class GoodsReceivedNote extends Model
         'discount_amount' => 'decimal:2',
         'net_amount' => 'decimal:2',
         'paid_amount' => 'decimal:2',
+        'payment_breakdown' => 'array',
     ];
 
     public function purchaseOrder(): BelongsTo
@@ -51,17 +56,22 @@ class GoodsReceivedNote extends Model
 
         static::creating(function ($grn) {
             if (empty($grn->grn_number)) {
-                $grn->grn_number = static::generateGrnNumber();
+                $grn->grn_number = static::generateGrnNumber((int) ($grn->tenant_id ?? 0));
             }
         });
     }
 
-    public static function generateGrnNumber(): string
+    public static function generateGrnNumber(int $tenantId = 0): string
     {
         $year = date('Y');
-        $lastGrn = static::where('grn_number', 'like', "GRN{$year}%")
-                        ->orderBy('grn_number', 'desc')
-                        ->first();
+        $query = static::query();
+        if ($tenantId > 0 && Schema::hasColumn('goods_received_notes', 'tenant_id')) {
+            $query->where('tenant_id', $tenantId);
+        }
+
+        $lastGrn = $query->where('grn_number', 'like', "GRN{$year}%")
+            ->orderBy('grn_number', 'desc')
+            ->first();
 
         if ($lastGrn) {
             $lastNumber = (int) substr($lastGrn->grn_number, -4);

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
+import { clearCacheByPrefix, readCache, writeCache } from '@/lib/swrCache';
 
 type DocumentType = 'quotation' | 'invoice';
 type ListFilter = 'all' | DocumentType;
@@ -156,9 +157,23 @@ const typeBadge = (type: DocumentType) =>
     ? 'bg-violet-500/15 text-violet-800 ring-violet-500/25'
     : 'bg-teal-500/15 text-teal-800 ring-teal-500/25';
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
+const INV_CACHE_TTL = {
+  access: 5 * 60 * 1000,
+  summary: 60 * 1000,
+  records: 30 * 1000,
+  storeItems: 5 * 60 * 1000,
+};
+const invCacheKey = (tokenValue: string, name: string) =>
+  `invoicing:${name}:${tokenValue.slice(-10)}`;
+
 export default function InvoicingPage() {
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
   const [token, setToken] = useState('');
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
 
   const [summary, setSummary] = useState<SummaryStats>({
     invoices_today: 0,
@@ -223,12 +238,127 @@ export default function InvoicingPage() {
 
   const [formMessage, setFormMessage] = useState('');
   const [formMessageType, setFormMessageType] = useState<'success' | 'error' | ''>('');
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+
+  const isColumnVisible = (key: string) => !hiddenModules.includes(key);
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
 
   const searchInitialized = useRef(false);
 
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchAccessProfile = async (authToken: string) => {
+    const cacheKey = invCacheKey(authToken, 'access');
+    const cached = readCache<{ canManage: boolean; hidden: string[] }>(cacheKey, INV_CACHE_TTL.access);
+    if (cached) {
+      setCanManageFeatureVisibility(cached.canManage);
+      setHiddenModules(cached.hidden);
+    }
+
+    try {
+      const [userRes, visibilityRes] = await Promise.all([
+        axios.get(`${API_URL}/api/user`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+      ]);
+
+      const superAdmin = isSuperAdminUser(userRes.data || {});
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      const canManage = superAdmin && Boolean(visibilityRes.data?.can_manage);
+      const hidden: string[] = Array.from(new Set<string>(hiddenModuleList));
+      setCanManageFeatureVisibility(canManage);
+      setHiddenModules(hidden);
+      writeCache(cacheKey, { canManage, hidden });
+    } catch (error) {
+      console.error('Error fetching invoicing visibility profile:', error);
+      if (!cached) {
+        setCanManageFeatureVisibility(false);
+        setHiddenModules([]);
+      }
+    }
+  };
+
+  const handleInvoicingVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating invoicing widget visibility:', error);
+    }
+  };
+
   useEffect(() => {
     const storedToken = localStorage.getItem('token');
-    if (storedToken) setToken(storedToken);
+    if (storedToken) {
+      setToken(storedToken);
+      fetchAccessProfile(storedToken);
+    }
+  }, []);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
   }, []);
 
   const listParams = useMemo(() => {
@@ -244,11 +374,19 @@ export default function InvoicingPage() {
 
   const fetchSummary = async () => {
     if (!token) return;
+    const cacheKey = invCacheKey(token, 'summary');
+    const cached = readCache<SummaryStats>(cacheKey, INV_CACHE_TTL.summary);
+    if (cached) {
+      setSummary(cached);
+    }
     try {
       const res = await axios.get(`${API_URL}/api/service-invoices/summary`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (res.data?.success) setSummary(res.data.data);
+      if (res.data?.success) {
+        setSummary(res.data.data);
+        writeCache(cacheKey, res.data.data as SummaryStats);
+      }
     } catch (error) {
       console.error('Error fetching invoicing summary:', error);
     }
@@ -256,36 +394,63 @@ export default function InvoicingPage() {
 
   const fetchRecords = async (page = currentPage) => {
     if (!token) return;
+    const requestParams = { ...listParams, page };
+    const cacheKey = invCacheKey(token, `records:${JSON.stringify(requestParams)}`);
+    const cached = readCache<{ rows: ServiceInvoiceRecord[]; lastPage: number; total: number }>(
+      cacheKey,
+      INV_CACHE_TTL.records
+    );
+    if (cached) {
+      setRecords(cached.rows);
+      setLastPage(cached.lastPage);
+      setTotalRecords(cached.total);
+      setListLoading(false);
+    }
     try {
-      setListLoading(true);
+      if (!cached) setListLoading(true);
       const res = await axios.get(`${API_URL}/api/service-invoices`, {
         headers: { Authorization: `Bearer ${token}` },
-        params: { ...listParams, page },
+        params: requestParams,
       });
       const payload = res.data?.success ? res.data.data : res.data;
       const rows = Array.isArray(payload) ? payload : payload?.data || [];
+      const nextLastPage = Number(payload?.last_page) || 1;
+      const nextTotal = Number(payload?.total) || rows.length;
       setRecords(rows as ServiceInvoiceRecord[]);
-      setLastPage(Number(payload?.last_page) || 1);
-      setTotalRecords(Number(payload?.total) || rows.length);
+      setLastPage(nextLastPage);
+      setTotalRecords(nextTotal);
+      writeCache(cacheKey, { rows, lastPage: nextLastPage, total: nextTotal });
     } catch (error) {
       console.error('Error fetching service invoices:', error);
-      setRecords([]);
-      setLastPage(1);
-      setTotalRecords(0);
+      if (!cached) {
+        setRecords([]);
+        setLastPage(1);
+        setTotalRecords(0);
+      }
     } finally {
       setListLoading(false);
     }
   };
 
-  const loadStoreItems = async () => {
+  const loadStoreItems = async (forceRefresh = false) => {
     if (!token) return;
+    const cacheKey = invCacheKey(token, 'store-items');
+    if (!forceRefresh) {
+      const cached = readCache<InventoryItem[]>(cacheKey, INV_CACHE_TTL.storeItems);
+      if (cached) {
+        setStoreItems(cached);
+        return;
+      }
+    }
     try {
       const res = await axios.get(`${API_URL}/api/stock/inventory`, {
         headers: { Authorization: `Bearer ${token}` },
         params: { per_page: 1000, status: 'active' },
       });
       if (res.data?.success) {
-        setStoreItems(parseInventoryRows(res));
+        const items = parseInventoryRows(res);
+        setStoreItems(items);
+        writeCache(cacheKey, items);
       } else {
         setStoreItems([]);
       }
@@ -642,6 +807,8 @@ export default function InvoicingPage() {
       setFormMessageType('success');
 
       setCurrentPage(1);
+      clearCacheByPrefix(invCacheKey(token, 'records'));
+      clearCacheByPrefix(invCacheKey(token, 'summary'));
       await fetchRecords(1);
       await fetchSummary();
 
@@ -650,7 +817,7 @@ export default function InvoicingPage() {
       }
 
       if (docType === 'invoice') {
-        await loadStoreItems();
+        await loadStoreItems(true);
       }
     } catch (error) {
       alert(extractApiError(error, `Failed to create ${docType}.`));
@@ -669,49 +836,127 @@ export default function InvoicingPage() {
     { value: 'invoice', label: 'Invoices' },
   ];
 
+  const visibleDocColumnCount = [
+    'invoicing-col-doc-no',
+    'invoicing-col-type',
+    'invoicing-col-customer',
+    'invoicing-col-phone',
+    'invoicing-col-date',
+    'invoicing-col-total',
+    'invoicing-col-paid',
+    'invoicing-col-balance',
+    'invoicing-col-actions',
+  ].filter((key) => isColumnVisible(key)).length;
+
   return (
     <div className="space-y-8 pb-10">
-      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-teal-950 via-cyan-950 to-teal-900 px-6 py-8 shadow-2xl shadow-teal-900/30 sm:px-10 sm:py-10">
-        <div className="pointer-events-none absolute -right-16 -top-16 h-56 w-56 rounded-full bg-cyan-400/20 blur-3xl" />
-        <div className="pointer-events-none absolute -bottom-20 left-10 h-48 w-48 rounded-full bg-teal-400/15 blur-3xl" />
-        <div className="relative z-10 flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
-          <div className="max-w-2xl">
-            <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1 text-xs font-medium uppercase tracking-widest text-teal-100 backdrop-blur-sm">
-              <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.9)]" />
-              Service · Invoicing
+      {isElementVisible('invoicing-el-hero') && (
+        <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-teal-950 via-cyan-950 to-teal-900 px-6 py-8 shadow-2xl shadow-teal-900/30 sm:px-10 sm:py-10">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleInvoicingVisibilityToggle('invoicing-el-hero', true); }}
+              className="absolute top-3 right-3 z-20 flex h-8 w-8 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide section"
+              aria-label="Hide invoicing hero section"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
+          <div className="pointer-events-none absolute -right-16 -top-16 h-56 w-56 rounded-full bg-cyan-400/20 blur-3xl" />
+          <div className="pointer-events-none absolute -bottom-20 left-10 h-48 w-48 rounded-full bg-teal-400/15 blur-3xl" />
+          <div className="relative z-10 flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
+            <div className="max-w-2xl">
+              <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1 text-xs font-medium uppercase tracking-widest text-teal-100 backdrop-blur-sm">
+                <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.9)]" />
+                Service · Invoicing
+              </div>
+              <h1 className="text-3xl font-bold tracking-tight text-white sm:text-4xl">
+                Quotations &amp; Invoices
+              </h1>
+              <p className="mt-3 text-sm leading-relaxed text-teal-100/90 sm:text-base">
+                Create standalone quotations and invoices, track payments, and manage customer
+                outstanding balances.
+              </p>
             </div>
-            <h1 className="text-3xl font-bold tracking-tight text-white sm:text-4xl">
-              Quotations &amp; Invoices
-            </h1>
-            <p className="mt-3 text-sm leading-relaxed text-teal-100/90 sm:text-base">
-              Create standalone quotations and invoices, track payments, and manage customer
-              outstanding balances.
-            </p>
+            <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
+              {isElementVisible('invoicing-el-btn-new-quotation') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleInvoicingVisibilityToggle('invoicing-el-btn-new-quotation', true); }}
+                      className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide button"
+                      aria-label="Hide new quotation button"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => handleOpenCreateModal('quotation')}
+                    className="inline-flex items-center justify-center gap-2 rounded-2xl border border-white/25 bg-white/10 px-6 py-3.5 text-sm font-semibold text-white backdrop-blur-sm transition hover:bg-white/20"
+                  >
+                    New Quotation
+                  </button>
+                </div>
+              )}
+              {isElementVisible('invoicing-el-btn-new-invoice') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleInvoicingVisibilityToggle('invoicing-el-btn-new-invoice', true); }}
+                      className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide button"
+                      aria-label="Hide new invoice button"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => handleOpenCreateModal('invoice')}
+                    className="group inline-flex items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-cyan-400 to-teal-400 px-8 py-4 text-base font-semibold text-slate-900 shadow-lg shadow-cyan-500/30 transition hover:scale-[1.02] active:scale-[0.98]"
+                  >
+                    <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-900/15 text-lg">
+                      +
+                    </span>
+                    New Invoice
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
-          <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
-            <button
-              type="button"
-              onClick={() => handleOpenCreateModal('quotation')}
-              className="inline-flex items-center justify-center gap-2 rounded-2xl border border-white/25 bg-white/10 px-6 py-3.5 text-sm font-semibold text-white backdrop-blur-sm transition hover:bg-white/20"
-            >
-              New Quotation
-            </button>
-            <button
-              type="button"
-              onClick={() => handleOpenCreateModal('invoice')}
-              className="group inline-flex items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-cyan-400 to-teal-400 px-8 py-4 text-base font-semibold text-slate-900 shadow-lg shadow-cyan-500/30 transition hover:scale-[1.02] active:scale-[0.98]"
-            >
-              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-900/15 text-lg">
-                +
-              </span>
-              New Invoice
-            </button>
-          </div>
-        </div>
-      </section>
+        </section>
+      )}
 
-      {formMessage && formMessageType === 'success' && !showDocModal && (
-        <div className="flex items-start gap-3 rounded-2xl border border-emerald-200/80 bg-gradient-to-r from-emerald-50 to-teal-50 px-5 py-4 shadow-sm">
+      {formMessage && formMessageType === 'success' && !showDocModal && isElementVisible('invoicing-el-success-message') && (
+        <div className="relative flex items-start gap-3 rounded-2xl border border-emerald-200/80 bg-gradient-to-r from-emerald-50 to-teal-50 px-5 py-4 shadow-sm">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleInvoicingVisibilityToggle('invoicing-el-success-message', true); }}
+              className="absolute top-2 right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide message"
+              aria-label="Hide success message"
+            >
+              <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
           <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-500 text-sm text-white">
             ✓
           </span>
@@ -749,29 +994,69 @@ export default function InvoicingPage() {
             icon: '💰',
             accent: 'from-emerald-500 to-teal-600',
           },
-        ].map((card) => (
-          <div
-            key={card.label}
-            className="group relative overflow-hidden rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md"
-          >
-            <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${card.accent}`} />
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                  {card.label}
-                </p>
-                <p className="mt-2 text-2xl font-bold text-slate-900">{card.value}</p>
-                <p className="mt-1 text-xs text-slate-500">{card.hint}</p>
+        ].map((card) => {
+          const visibilityMap: Record<string, string> = {
+            'Invoices Today': 'invoicing-el-stat-invoices-today',
+            'Active Quotations': 'invoicing-el-stat-active-quotations',
+            'Unpaid Invoices': 'invoicing-el-stat-unpaid-invoices',
+            'Outstanding Total': 'invoicing-el-stat-outstanding-total',
+          };
+          const key = visibilityMap[card.label];
+          if (!key || !isElementVisible(key)) return null;
+
+          return (
+            <div
+              key={card.label}
+              className="group relative overflow-hidden rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md"
+            >
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleInvoicingVisibilityToggle(key, true); }}
+                  className="absolute top-2 right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                  title="Hide stat"
+                  aria-label={`Hide ${card.label}`}
+                >
+                  <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M18 6 6 18" />
+                    <path d="m6 6 12 12" />
+                  </svg>
+                </button>
+              )}
+              <div className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${card.accent}`} />
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                    {card.label}
+                  </p>
+                  <p className="mt-2 text-2xl font-bold text-slate-900">{card.value}</p>
+                  <p className="mt-1 text-xs text-slate-500">{card.hint}</p>
+                </div>
+                <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-50 text-xl">
+                  {card.icon}
+                </span>
               </div>
-              <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-50 text-xl">
-                {card.icon}
-              </span>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
-      <section className="overflow-hidden rounded-3xl border border-slate-200/80 bg-white shadow-xl shadow-slate-200/50">
+      {isElementVisible('invoicing-sec-documents') && (
+      <section className="relative overflow-hidden rounded-3xl border border-slate-200/80 bg-white shadow-xl shadow-slate-200/50">
+        {showWidgetCloseButtons && (
+          <button
+            type="button"
+            onClick={() => { void handleInvoicingVisibilityToggle('invoicing-sec-documents', true); }}
+            className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+            title="Hide section"
+            aria-label="Hide documents section"
+          >
+            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M18 6 6 18" />
+              <path d="m6 6 12 12" />
+            </svg>
+          </button>
+        )}
         <div className="border-b border-slate-100 bg-gradient-to-r from-teal-50/80 via-white to-cyan-50/40 px-5 py-6 sm:px-8">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
             <div>
@@ -782,37 +1067,69 @@ export default function InvoicingPage() {
               </p>
             </div>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-              <div className="relative">
-                <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400">
-                  ⌕
-                </span>
-                <input
-                  type="search"
-                  value={listSearch}
-                  onChange={(e) => setListSearch(e.target.value)}
-                  placeholder="Search doc #, customer, phone, vehicle..."
-                  className="w-full rounded-xl border border-slate-200 bg-white py-2.5 pl-10 pr-4 text-sm text-slate-900 shadow-sm placeholder:text-slate-400 focus:border-teal-400 focus:ring-4 focus:ring-teal-100 focus:outline-none sm:w-80"
-                />
-              </div>
-              <div className="flex flex-wrap gap-1.5 rounded-xl border border-slate-200 bg-slate-50/80 p-1">
-                {filterPills.map((pill) => (
-                  <button
-                    key={pill.value}
-                    type="button"
-                    onClick={() => {
-                      setListFilter(pill.value);
-                      setCurrentPage(1);
-                    }}
-                    className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
-                      listFilter === pill.value
-                        ? 'bg-white text-teal-700 shadow-sm ring-1 ring-teal-200'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    {pill.label}
-                  </button>
-                ))}
-              </div>
+              {isElementVisible('invoicing-el-search') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleInvoicingVisibilityToggle('invoicing-el-search', true); }}
+                      className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide search"
+                      aria-label="Hide search"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400">
+                    ⌕
+                  </span>
+                  <input
+                    type="search"
+                    value={listSearch}
+                    onChange={(e) => setListSearch(e.target.value)}
+                    placeholder="Search doc #, customer, phone, vehicle..."
+                    className="w-full rounded-xl border border-slate-200 bg-white py-2.5 pl-10 pr-4 text-sm text-slate-900 shadow-sm placeholder:text-slate-400 focus:border-teal-400 focus:ring-4 focus:ring-teal-100 focus:outline-none sm:w-80"
+                  />
+                </div>
+              )}
+              {isElementVisible('invoicing-el-filter-pills') && (
+                <div className="relative flex flex-wrap gap-1.5 rounded-xl border border-slate-200 bg-slate-50/80 p-1">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleInvoicingVisibilityToggle('invoicing-el-filter-pills', true); }}
+                      className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide filters"
+                      aria-label="Hide filters"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  {filterPills.map((pill) => (
+                    <button
+                      key={pill.value}
+                      type="button"
+                      onClick={() => {
+                        setListFilter(pill.value);
+                        setCurrentPage(1);
+                      }}
+                      className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
+                        listFilter === pill.value
+                          ? 'bg-white text-teal-700 shadow-sm ring-1 ring-teal-200'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {pill.label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -821,29 +1138,209 @@ export default function InvoicingPage() {
           <table className="min-w-full">
             <thead>
               <tr className="bg-slate-900 text-left text-xs font-semibold uppercase tracking-wider text-slate-300">
-                <th className="px-5 py-3.5">Doc #</th>
-                <th className="px-5 py-3.5">Type</th>
-                <th className="px-5 py-3.5">Customer</th>
-                <th className="px-5 py-3.5">Phone</th>
-                <th className="px-5 py-3.5">Date</th>
-                <th className="px-5 py-3.5 text-right">Total</th>
-                <th className="px-5 py-3.5 text-right">Paid</th>
-                <th className="px-5 py-3.5 text-right">Balance</th>
-                <th className="px-5 py-3.5"></th>
+                {isColumnVisible('invoicing-col-doc-no') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center gap-2">
+                      <span>Doc #</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleInvoicingVisibilityToggle('invoicing-col-doc-no', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Doc # column"
+                          aria-label="Hide Doc # column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('invoicing-col-type') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center gap-2">
+                      <span>Type</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleInvoicingVisibilityToggle('invoicing-col-type', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Type column"
+                          aria-label="Hide Type column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('invoicing-col-customer') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center gap-2">
+                      <span>Customer</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleInvoicingVisibilityToggle('invoicing-col-customer', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Customer column"
+                          aria-label="Hide Customer column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('invoicing-col-phone') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center gap-2">
+                      <span>Phone</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleInvoicingVisibilityToggle('invoicing-col-phone', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Phone column"
+                          aria-label="Hide Phone column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('invoicing-col-date') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center gap-2">
+                      <span>Date</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleInvoicingVisibilityToggle('invoicing-col-date', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Date column"
+                          aria-label="Hide Date column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('invoicing-col-total') && (
+                  <th className="px-5 py-3.5 text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      <span>Total</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleInvoicingVisibilityToggle('invoicing-col-total', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Total column"
+                          aria-label="Hide Total column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('invoicing-col-paid') && (
+                  <th className="px-5 py-3.5 text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      <span>Paid</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleInvoicingVisibilityToggle('invoicing-col-paid', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Paid column"
+                          aria-label="Hide Paid column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('invoicing-col-balance') && (
+                  <th className="px-5 py-3.5 text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      <span>Balance</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleInvoicingVisibilityToggle('invoicing-col-balance', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Balance column"
+                          aria-label="Hide Balance column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('invoicing-col-actions') && (
+                  <th className="px-5 py-3.5">
+                    <div className="flex items-center justify-end gap-2">
+                      <span>Actions</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleInvoicingVisibilityToggle('invoicing-col-actions', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Actions column"
+                          aria-label="Hide Actions column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {listLoading ? (
                 Array.from({ length: 5 }).map((_, i) => (
                   <tr key={i} className="animate-pulse">
-                    <td colSpan={9} className="px-5 py-4">
+                    <td colSpan={Math.max(visibleDocColumnCount, 1)} className="px-5 py-4">
                       <div className="h-4 rounded-lg bg-slate-100" />
                     </td>
                   </tr>
                 ))
               ) : records.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="px-5 py-16 text-center">
+                  <td colSpan={Math.max(visibleDocColumnCount, 1)} className="px-5 py-16 text-center">
                     <div className="mx-auto max-w-sm">
                       <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-teal-100 to-cyan-100 text-3xl">
                         🧾
@@ -858,54 +1355,68 @@ export default function InvoicingPage() {
               ) : (
                 records.map((row) => (
                   <tr key={row.id} className="transition hover:bg-slate-50/80">
-                    <td className="px-5 py-4 font-mono text-sm font-semibold text-slate-900">
-                      {row.document_number}
-                    </td>
-                    <td className="px-5 py-4">
-                      <span
-                        className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold capitalize ring-1 ${typeBadge(row.document_type)}`}
-                      >
-                        {row.document_type}
-                      </span>
-                    </td>
-                    <td className="px-5 py-4 text-sm text-slate-800">{row.customer_name}</td>
-                    <td className="px-5 py-4 text-sm text-slate-600">{row.customer_phone}</td>
-                    <td className="px-5 py-4 text-sm text-slate-600">
-                      {fmtDocDate(row.document_date)}
-                    </td>
-                    <td className="px-5 py-4 text-right text-sm font-semibold text-slate-900">
-                      {money(Number(row.total_amount))}
-                    </td>
-                    <td className="px-5 py-4 text-right text-sm text-slate-600">
-                      {row.document_type === 'invoice'
-                        ? money(Number(row.paid_amount || 0))
-                        : '—'}
-                    </td>
-                    <td className="px-5 py-4 text-right text-sm text-slate-600">
-                      {row.document_type === 'invoice'
-                        ? money(Number(row.balance_amount || 0))
-                        : '—'}
-                    </td>
-                    <td className="px-5 py-4">
-                      <div className="flex flex-wrap justify-end gap-2">
-                        <button
-                          type="button"
-                          onClick={() => openDocumentPrint(row.id)}
-                          className="whitespace-nowrap rounded-lg bg-teal-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-teal-500"
+                    {isColumnVisible('invoicing-col-doc-no') && (
+                      <td className="px-5 py-4 font-mono text-sm font-semibold text-slate-900">
+                        {row.document_number}
+                      </td>
+                    )}
+                    {isColumnVisible('invoicing-col-type') && (
+                      <td className="px-5 py-4">
+                        <span
+                          className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold capitalize ring-1 ${typeBadge(row.document_type)}`}
                         >
-                          View / Print
-                        </button>
-                        {row.document_type === 'quotation' && (
+                          {row.document_type}
+                        </span>
+                      </td>
+                    )}
+                    {isColumnVisible('invoicing-col-customer') && <td className="px-5 py-4 text-sm text-slate-800">{row.customer_name}</td>}
+                    {isColumnVisible('invoicing-col-phone') && <td className="px-5 py-4 text-sm text-slate-600">{row.customer_phone}</td>}
+                    {isColumnVisible('invoicing-col-date') && (
+                      <td className="px-5 py-4 text-sm text-slate-600">
+                        {fmtDocDate(row.document_date)}
+                      </td>
+                    )}
+                    {isColumnVisible('invoicing-col-total') && (
+                      <td className="px-5 py-4 text-right text-sm font-semibold text-slate-900">
+                        {money(Number(row.total_amount))}
+                      </td>
+                    )}
+                    {isColumnVisible('invoicing-col-paid') && (
+                      <td className="px-5 py-4 text-right text-sm text-slate-600">
+                        {row.document_type === 'invoice'
+                          ? money(Number(row.paid_amount || 0))
+                          : '—'}
+                      </td>
+                    )}
+                    {isColumnVisible('invoicing-col-balance') && (
+                      <td className="px-5 py-4 text-right text-sm text-slate-600">
+                        {row.document_type === 'invoice'
+                          ? money(Number(row.balance_amount || 0))
+                          : '—'}
+                      </td>
+                    )}
+                    {isColumnVisible('invoicing-col-actions') && (
+                      <td className="px-5 py-4">
+                        <div className="flex flex-wrap justify-end gap-2">
                           <button
                             type="button"
-                            onClick={() => handleMakeInvoiceFromQuotation(row)}
-                            className="whitespace-nowrap rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
+                            onClick={() => openDocumentPrint(row.id)}
+                            className="whitespace-nowrap rounded-lg bg-teal-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-teal-500"
                           >
-                            Make Invoice
+                            View / Print
                           </button>
-                        )}
-                      </div>
-                    </td>
+                          {row.document_type === 'quotation' && (
+                            <button
+                              type="button"
+                              onClick={() => handleMakeInvoiceFromQuotation(row)}
+                              className="whitespace-nowrap rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
+                            >
+                              Make Invoice
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    )}
                   </tr>
                 ))
               )}
@@ -913,7 +1424,7 @@ export default function InvoicingPage() {
           </table>
         </div>
 
-        {lastPage > 1 && (
+        {lastPage > 1 && isElementVisible('invoicing-sec-pagination') && (
           <div className="flex items-center justify-between border-t border-slate-100 px-5 py-4 sm:px-8">
             <button
               type="button"
@@ -937,6 +1448,7 @@ export default function InvoicingPage() {
           </div>
         )}
       </section>
+      )}
 
       {showDocModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-3 backdrop-blur-md sm:p-4">

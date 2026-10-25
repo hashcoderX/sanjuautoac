@@ -5,6 +5,15 @@ import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import axios from 'axios';
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
+const toVisibilitySlug = (value: string) =>
+  value
+    .toLowerCase()
+    .replace(/&/g, 'and')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+
 type ReportItem = {
   name: string;
   description: string;
@@ -24,11 +33,84 @@ type ReportCategory = {
 export default function ReportsPage() {
   const [token, setToken] = useState('');
   const [accessReady, setAccessReady] = useState(false);
-  const [isAdminUser, setIsAdminUser] = useState(false);
-  const [reportPermission, setReportPermission] = useState(false);
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [modalMessage, setModalMessage] = useState('');
   const router = useRouter();
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
+
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
+
+  const categoryVisibilityKey = (categoryName: string) => `reports-sec-category-${toVisibilitySlug(categoryName)}`;
+  const reportCardVisibilityKey = (reportName: string) => `reports-el-card-${toVisibilitySlug(reportName)}`;
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchVisibilityProfile = async (authToken: string, userData: any) => {
+    try {
+      const visibilityRes = await axios.get(`${API_URL}/api/feature-visibility`, {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      const superAdmin = isSuperAdminUser(userData || {});
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching reports visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleReportsVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating reports widget visibility:', error);
+    }
+  };
 
   useEffect(() => {
     const storedToken = localStorage.getItem('token');
@@ -61,34 +143,10 @@ export default function ReportsPage() {
           .map((role) => role.trim().toLowerCase())
           .filter(Boolean);
 
-        const permissionNames = Array.isArray(userData?.roles)
-          ? userData.roles.flatMap((role: any) =>
-              Array.isArray(role?.permissions)
-                ? role.permissions.map((permission: any) =>
-                    String(permission?.name || '').trim().toLowerCase()
-                  )
-                : []
-            )
-          : [];
-
         const roleBlob = roleNames.join(' ');
-        const adminUser =
-          !employeeId ||
-          roleBlob.includes('super admin') ||
-          roleBlob.includes('superadmin') ||
-          roleBlob.includes('administrator') ||
-          roleBlob.includes('admin');
-
-        const hasReportPermission = permissionNames.some((permission: string) => permission.includes('report'));
-        setIsAdminUser(adminUser);
-        setReportPermission(hasReportPermission);
-
-        if (!adminUser && !hasReportPermission) {
-          router.push('/dashboard');
-        }
+        await fetchVisibilityProfile(token, userData);
       } catch (error) {
         console.error('Error fetching reports access profile:', error);
-        router.push('/dashboard');
       } finally {
         setAccessReady(true);
       }
@@ -96,6 +154,30 @@ export default function ReportsPage() {
 
     fetchAccessProfile();
   }, [token, router]);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
 
   const categories: ReportCategory[] = useMemo(
     () => [
@@ -165,10 +247,6 @@ export default function ReportsPage() {
     );
   }
 
-  if (!isAdminUser && !reportPermission) {
-    return null;
-  }
-
   return (
     <div className="min-h-screen bg-gradient-to-br from-rose-50 via-orange-50 to-amber-50 relative overflow-hidden">
       <div className="absolute inset-0 opacity-30">
@@ -177,58 +255,111 @@ export default function ReportsPage() {
         <div className="absolute -bottom-8 left-40 w-72 h-72 bg-amber-200 rounded-full mix-blend-multiply filter blur-xl animate-pulse animation-delay-4000"></div>
       </div>
 
-      <nav className="relative z-10 bg-white/80 backdrop-blur-lg shadow-lg border-b border-white/20">
+      {isElementVisible('reports-el-navbar') && (
+        <nav className="relative z-10 bg-white/80 backdrop-blur-lg shadow-lg border-b border-white/20">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex flex-col sm:flex-row justify-between sm:items-center h-auto sm:h-16 py-3 sm:py-0 gap-3 sm:gap-0">
+          <div className="relative flex flex-col sm:flex-row justify-between sm:items-center h-auto sm:h-16 py-3 sm:py-0 gap-3 sm:gap-0">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleReportsVisibilityToggle('reports-el-navbar', true); }}
+                className="absolute -right-2 -top-2 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+                title="Hide top bar"
+                aria-label="Hide top bar"
+              >
+                x
+              </button>
+            )}
             <div className="flex items-center justify-between sm:justify-start">
-              <Link href="/dashboard" className="flex items-center space-x-2 text-gray-700 hover:text-rose-600 transition-colors duration-300">
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-                </svg>
-                <span className="font-medium">Back to Dashboard</span>
-              </Link>
+              {isElementVisible('reports-el-link-back') && (
+                <Link href="/dashboard" className="flex items-center space-x-2 text-gray-700 hover:text-rose-600 transition-colors duration-300">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                  </svg>
+                  <span className="font-medium">Back to Dashboard</span>
+                </Link>
+              )}
             </div>
             <div className="flex items-center justify-between sm:justify-end space-x-3 sm:space-x-4">
-              <div className="hidden md:flex items-center space-x-2 text-sm text-gray-600">
-                <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-                <span>Reports Module Ready</span>
-              </div>
-              <button
-                onClick={() => {
-                  localStorage.removeItem('token');
-                  router.push('/');
-                }}
-                className="bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600 text-white px-6 py-2 rounded-full text-sm font-medium transition-all duration-300 transform hover:scale-105 shadow-lg hover:shadow-xl"
-              >
-                Logout
-              </button>
+              {isElementVisible('reports-el-status-ready') && (
+                <div className="hidden md:flex items-center space-x-2 text-sm text-gray-600">
+                  <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+                  <span>Reports Module Ready</span>
+                </div>
+              )}
+              {isElementVisible('reports-el-btn-logout') && (
+                <button
+                  onClick={() => {
+                    localStorage.removeItem('token');
+                    router.push('/');
+                  }}
+                  className="bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600 text-white px-6 py-2 rounded-full text-sm font-medium transition-all duration-300 transform hover:scale-105 shadow-lg hover:shadow-xl"
+                >
+                  Logout
+                </button>
+              )}
             </div>
           </div>
         </div>
       </nav>
+      )}
 
       <main className="relative z-10 max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
-        <div className="text-center mb-10">
-          <div className="inline-block p-1 bg-gradient-to-r from-rose-500 to-orange-500 rounded-full mb-6">
-            <div className="bg-white rounded-full p-4">
-              <span className="text-4xl">📊</span>
+        {isElementVisible('reports-sec-hero') && (
+          <div className="relative text-center mb-10">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleReportsVisibilityToggle('reports-sec-hero', true); }}
+              className="absolute right-0 top-0 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+              title="Hide hero section"
+              aria-label="Hide hero section"
+            >
+              x
+            </button>
+          )}
+          {isElementVisible('reports-el-hero-icon') && (
+            <div className="inline-block p-1 bg-gradient-to-r from-rose-500 to-orange-500 rounded-full mb-6">
+              <div className="bg-white rounded-full p-4">
+                <span className="text-4xl">📊</span>
+              </div>
             </div>
-          </div>
-          <h1 className="text-4xl md:text-5xl font-bold text-gray-900 mb-4">
-            Reports <span className="bg-gradient-to-r from-rose-600 to-orange-600 bg-clip-text text-transparent">Center</span>
-          </h1>
-          <p className="text-lg sm:text-xl text-gray-600 max-w-3xl mx-auto leading-relaxed">
-            Unified report hub organized by business area. You can provide report topics one-by-one, and each report will be implemented in this module.
-          </p>
-          <div className="mt-5 inline-flex items-center gap-2 rounded-full bg-white/80 border border-white/70 px-4 py-2 text-sm text-gray-700 shadow">
-            <span className="font-semibold">{totalReports}</span>
-            <span>report options configured</span>
-          </div>
+          )}
+          {isElementVisible('reports-el-hero-title') && (
+            <h1 className="text-4xl md:text-5xl font-bold text-gray-900 mb-4">
+              Reports <span className="bg-gradient-to-r from-rose-600 to-orange-600 bg-clip-text text-transparent">Center</span>
+            </h1>
+          )}
+          {isElementVisible('reports-el-hero-description') && (
+            <p className="text-lg sm:text-xl text-gray-600 max-w-3xl mx-auto leading-relaxed">
+              Unified report hub organized by business area. You can provide report topics one-by-one, and each report will be implemented in this module.
+            </p>
+          )}
+          {isElementVisible('reports-el-total-options') && (
+            <div className="mt-5 inline-flex items-center gap-2 rounded-full bg-white/80 border border-white/70 px-4 py-2 text-sm text-gray-700 shadow">
+              <span className="font-semibold">{totalReports}</span>
+              <span>report options configured</span>
+            </div>
+          )}
         </div>
+        )}
 
-        <div className="space-y-8">
+        {isElementVisible('reports-sec-categories') && (
+          <div className="space-y-8">
           {categories.map((category) => (
-            <section key={category.name} className="bg-white/70 backdrop-blur-sm rounded-2xl shadow-xl border border-white/20 overflow-hidden">
+            isElementVisible(categoryVisibilityKey(category.name)) ? (
+              <section key={category.name} className="relative bg-white/70 backdrop-blur-sm rounded-2xl shadow-xl border border-white/20 overflow-hidden">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleReportsVisibilityToggle(categoryVisibilityKey(category.name), true); }}
+                  className="absolute right-3 top-3 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+                  title={`Hide ${category.name}`}
+                  aria-label={`Hide ${category.name}`}
+                >
+                  x
+                </button>
+              )}
               <div className={`bg-gradient-to-r ${category.color} p-5`}>
                 <div className="flex items-center gap-3">
                   <div className="w-10 h-10 rounded-xl bg-white/20 flex items-center justify-center text-xl">{category.icon}</div>
@@ -241,28 +372,55 @@ export default function ReportsPage() {
 
               <div className="p-5 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {category.reports.map((report) => (
-                  <button
-                    key={report.name}
-                    type="button"
-                    onClick={() => handleReportOpen(report)}
-                    className={`text-left group relative rounded-xl border border-white/40 bg-gradient-to-br ${category.bgColor} p-4 hover:shadow-lg transition-all duration-300 transform hover:-translate-y-1`}
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <div className="text-xl mb-2">{report.icon}</div>
-                        <h3 className="font-semibold text-gray-900 group-hover:text-gray-800 transition-colors duration-300">{report.name}</h3>
-                        <p className="mt-1 text-sm text-gray-600 group-hover:text-gray-700 transition-colors duration-300">{report.description}</p>
+                  isElementVisible(reportCardVisibilityKey(report.name)) ? (
+                    <button
+                      key={report.name}
+                      type="button"
+                      onClick={() => handleReportOpen(report)}
+                      className={`text-left group relative rounded-xl border border-white/40 bg-gradient-to-br ${category.bgColor} p-4 hover:shadow-lg transition-all duration-300 transform hover:-translate-y-1`}
+                    >
+                      {showWidgetCloseButtons && (
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            void handleReportsVisibilityToggle(reportCardVisibilityKey(report.name), true);
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter' || event.key === ' ') {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              void handleReportsVisibilityToggle(reportCardVisibilityKey(report.name), true);
+                            }
+                          }}
+                          className="absolute right-2 top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                          title={`Hide ${report.name}`}
+                          aria-label={`Hide ${report.name}`}
+                        >
+                          x
+                        </span>
+                      )}
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="text-xl mb-2">{report.icon}</div>
+                          <h3 className="font-semibold text-gray-900 group-hover:text-gray-800 transition-colors duration-300">{report.name}</h3>
+                          <p className="mt-1 text-sm text-gray-600 group-hover:text-gray-700 transition-colors duration-300">{report.description}</p>
+                        </div>
+                        <span className="shrink-0 inline-flex items-center rounded-full bg-white/80 border border-white text-[10px] font-semibold px-2 py-1 text-gray-700">
+                          {report.comingSoon ? 'Planned' : 'Live'}
+                        </span>
                       </div>
-                      <span className="shrink-0 inline-flex items-center rounded-full bg-white/80 border border-white text-[10px] font-semibold px-2 py-1 text-gray-700">
-                        {report.comingSoon ? 'Planned' : 'Live'}
-                      </span>
-                    </div>
-                  </button>
+                    </button>
+                  ) : null
                 ))}
               </div>
             </section>
+            ) : null
           ))}
         </div>
+        )}
       </main>
 
       {modalMessage ? (

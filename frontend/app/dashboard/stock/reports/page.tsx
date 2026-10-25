@@ -6,6 +6,8 @@ import axios from 'axios';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
 interface InventoryItem {
   id: number;
   name: string;
@@ -29,6 +31,9 @@ type StockStateFilter = 'all' | 'out_of_stock' | 'low_stock' | 'healthy_stock' |
 
 export default function StockReports() {
   const [token, setToken] = useState('');
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
@@ -42,14 +47,114 @@ export default function StockReports() {
   const router = useRouter();
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
 
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+  const isColumnVisible = (key: string) => !hiddenModules.includes(key);
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchAccessProfile = async (authToken: string) => {
+    try {
+      const [userRes, visibilityRes] = await Promise.all([
+        axios.get(`${API_URL}/api/user`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+      ]);
+
+      const superAdmin = isSuperAdminUser(userRes.data || {});
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching stock reports visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleStockReportsVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating stock reports widget visibility:', error);
+    }
+  };
+
   useEffect(() => {
     const storedToken = localStorage.getItem('token');
     if (!storedToken) {
       router.push('/');
     } else {
       setToken(storedToken);
+      fetchAccessProfile(storedToken);
     }
   }, [router]);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
 
   useEffect(() => {
     if (token) {
@@ -281,7 +386,19 @@ export default function StockReports() {
 
   return (
     <div className="min-h-screen space-y-6 bg-[radial-gradient(circle_at_top_left,_rgba(251,146,60,0.16),_transparent_23%),radial-gradient(circle_at_top_right,_rgba(245,158,11,0.12),_transparent_26%),linear-gradient(180deg,_#fffaf5_0%,_#fff7ed_42%,_#fff3e4_100%)] p-4 sm:p-6 lg:p-8">
-      <div className="overflow-hidden rounded-[30px] border border-white/70 bg-white/80 shadow-[0_26px_90px_-45px_rgba(194,65,12,0.5)] backdrop-blur-xl">
+      {isElementVisible('stock-reports-el-header') && (
+        <div className="relative overflow-hidden rounded-[30px] border border-white/70 bg-white/80 shadow-[0_26px_90px_-45px_rgba(194,65,12,0.5)] backdrop-blur-xl">
+        {showWidgetCloseButtons && (
+          <button
+            type="button"
+            onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-el-header', true); }}
+            className="absolute right-3 top-3 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+            title="Hide header"
+            aria-label="Hide header"
+          >
+            x
+          </button>
+        )}
         <div className="grid gap-8 px-5 py-6 sm:px-6 lg:grid-cols-[1.35fr_1fr] lg:px-8">
           <div className="space-y-4">
             <div className="inline-flex items-center gap-2 rounded-full border border-orange-200 bg-orange-50 px-4 py-1.5 text-sm font-semibold text-orange-700">
@@ -295,53 +412,153 @@ export default function StockReports() {
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-3 pt-1">
-              <button
-                onClick={downloadCsv}
-                className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-5 py-2.5 text-sm font-semibold text-emerald-700 transition hover:bg-emerald-100"
-              >
-                Download CSV
-              </button>
-              <button
-                onClick={downloadPdf}
-                className="inline-flex items-center rounded-full border border-blue-200 bg-blue-50 px-5 py-2.5 text-sm font-semibold text-blue-700 transition hover:bg-blue-100"
-              >
-                Download PDF
-              </button>
-              <button
-                onClick={fetchReportData}
-                className="inline-flex items-center rounded-full border border-orange-200 bg-white px-5 py-2.5 text-sm font-semibold text-orange-700 transition hover:bg-orange-50"
-              >
-                Refresh
-              </button>
+              {isElementVisible('stock-reports-el-btn-download-csv') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-el-btn-download-csv', true); }}
+                      className="absolute -right-2 -top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                      title="Hide CSV button"
+                      aria-label="Hide CSV button"
+                    >
+                      x
+                    </button>
+                  )}
+                  <button
+                    onClick={downloadCsv}
+                    className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-5 py-2.5 text-sm font-semibold text-emerald-700 transition hover:bg-emerald-100"
+                  >
+                    Download CSV
+                  </button>
+                </div>
+              )}
+              {isElementVisible('stock-reports-el-btn-download-pdf') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-el-btn-download-pdf', true); }}
+                      className="absolute -right-2 -top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                      title="Hide PDF button"
+                      aria-label="Hide PDF button"
+                    >
+                      x
+                    </button>
+                  )}
+                  <button
+                    onClick={downloadPdf}
+                    className="inline-flex items-center rounded-full border border-blue-200 bg-blue-50 px-5 py-2.5 text-sm font-semibold text-blue-700 transition hover:bg-blue-100"
+                  >
+                    Download PDF
+                  </button>
+                </div>
+              )}
+              {isElementVisible('stock-reports-el-btn-refresh') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-el-btn-refresh', true); }}
+                      className="absolute -right-2 -top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                      title="Hide refresh button"
+                      aria-label="Hide refresh button"
+                    >
+                      x
+                    </button>
+                  )}
+                  <button
+                    onClick={fetchReportData}
+                    className="inline-flex items-center rounded-full border border-orange-200 bg-white px-5 py-2.5 text-sm font-semibold text-orange-700 transition hover:bg-orange-50"
+                  >
+                    Refresh
+                  </button>
+                </div>
+              )}
             </div>
           </div>
 
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1">
-            <div className="rounded-3xl border border-orange-200/70 bg-gradient-to-br from-orange-500 to-amber-500 p-5 text-white shadow-lg shadow-orange-300/45">
+            {isElementVisible('stock-reports-el-stat-rows') && (
+              <div className="relative rounded-3xl border border-orange-200/70 bg-gradient-to-br from-orange-500 to-amber-500 p-5 text-white shadow-lg shadow-orange-300/45">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-el-stat-rows', true); }}
+                  className="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full border border-white/40 bg-white/20 text-xs font-bold text-white hover:bg-white/30"
+                  title="Hide rows stat"
+                  aria-label="Hide rows stat"
+                >
+                  x
+                </button>
+              )}
               <p className="text-xs uppercase tracking-[0.24em] text-white/80">Rows in Report</p>
               <p className="mt-2 text-3xl font-bold">{totalItems}</p>
               <p className="mt-2 text-sm text-white/85">Based on your current filters</p>
             </div>
-            <div className="rounded-3xl border border-red-200 bg-white p-5 shadow-sm">
+            )}
+            {isElementVisible('stock-reports-el-stat-out-of-stock') && (
+              <div className="relative rounded-3xl border border-red-200 bg-white p-5 shadow-sm">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-el-stat-out-of-stock', true); }}
+                  className="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                  title="Hide out of stock stat"
+                  aria-label="Hide out of stock stat"
+                >
+                  x
+                </button>
+              )}
               <p className="text-xs uppercase tracking-[0.24em] text-red-500">Out of Stock</p>
               <p className="mt-2 text-3xl font-bold text-slate-900">{outOfStockCount}</p>
               <p className="mt-2 text-sm text-slate-500">Need immediate action</p>
             </div>
-            <div className="rounded-3xl border border-amber-200 bg-white p-5 shadow-sm sm:col-span-2 lg:col-span-1">
+            )}
+            {isElementVisible('stock-reports-el-stat-low-stock') && (
+              <div className="relative rounded-3xl border border-amber-200 bg-white p-5 shadow-sm sm:col-span-2 lg:col-span-1">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-el-stat-low-stock', true); }}
+                  className="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full border border-amber-200 bg-white text-xs font-bold text-amber-600 hover:bg-amber-50"
+                  title="Hide low stock stat"
+                  aria-label="Hide low stock stat"
+                >
+                  x
+                </button>
+              )}
               <p className="text-xs uppercase tracking-[0.24em] text-amber-600">Low Stock</p>
               <p className="mt-2 text-3xl font-bold text-slate-900">{lowStockCount}</p>
               <p className="mt-2 text-sm text-slate-500">Near reorder point</p>
             </div>
+            )}
           </div>
         </div>
       </div>
+      )}
 
-      <div className="overflow-hidden rounded-2xl border border-orange-100 bg-white shadow-[0_18px_65px_-35px_rgba(194,65,12,0.42)]">
+      {isElementVisible('stock-reports-sec-filters') && (
+        <div className="relative overflow-hidden rounded-2xl border border-orange-100 bg-white shadow-[0_18px_65px_-35px_rgba(194,65,12,0.42)]">
+        {showWidgetCloseButtons && (
+          <button
+            type="button"
+            onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-sec-filters', true); }}
+            className="absolute right-3 top-3 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+            title="Hide filters section"
+            aria-label="Hide filters section"
+          >
+            x
+          </button>
+        )}
         <div className="border-b border-orange-100 bg-gradient-to-r from-white via-orange-50/70 to-amber-50/70 px-5 py-4">
-          <h4 className="text-sm font-semibold uppercase tracking-[0.2em] text-orange-700">Filter Reports</h4>
+          {isElementVisible('stock-reports-el-title-filters') && (
+            <h4 className="text-sm font-semibold uppercase tracking-[0.2em] text-orange-700">Filter Reports</h4>
+          )}
         </div>
         <div className="grid grid-cols-1 gap-4 p-5 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
-          <div className="xl:col-span-2">
+          {isElementVisible('stock-reports-el-filter-search') && (
+            <div className="xl:col-span-2">
             <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Search</label>
             <input
               type="text"
@@ -351,8 +568,10 @@ export default function StockReports() {
               className="mt-1.5 block w-full rounded-xl border border-orange-100 bg-gradient-to-b from-white to-orange-50/30 px-3.5 py-2.5 text-sm text-gray-900 shadow-sm transition-all duration-200 placeholder:text-gray-400 focus:border-orange-400 focus:ring-4 focus:ring-orange-100 focus:outline-none"
             />
           </div>
+          )}
 
-          <div>
+          {isElementVisible('stock-reports-el-filter-store-type') && (
+            <div>
             <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Store Type</label>
             <select
               value={storeType}
@@ -364,8 +583,10 @@ export default function StockReports() {
               <option value="finished_good">Finished Good</option>
             </select>
           </div>
+          )}
 
-          <div>
+          {isElementVisible('stock-reports-el-filter-item-status') && (
+            <div>
             <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Item Status</label>
             <select
               value={statusFilter}
@@ -377,8 +598,10 @@ export default function StockReports() {
               <option value="inactive">Inactive</option>
             </select>
           </div>
+          )}
 
-          <div>
+          {isElementVisible('stock-reports-el-filter-stock-state') && (
+            <div>
             <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Stock State</label>
             <select
               value={stockStateFilter}
@@ -392,8 +615,10 @@ export default function StockReports() {
               <option value="over_stock">Overstock</option>
             </select>
           </div>
+          )}
 
-          <div>
+          {isElementVisible('stock-reports-el-filter-date-from') && (
+            <div>
             <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Updated From</label>
             <input
               type="date"
@@ -402,8 +627,10 @@ export default function StockReports() {
               className="mt-1.5 block w-full rounded-xl border border-orange-100 bg-gradient-to-b from-white to-orange-50/30 px-3.5 py-2.5 text-sm text-gray-900 shadow-sm transition-all duration-200 focus:border-orange-400 focus:ring-4 focus:ring-orange-100 focus:outline-none"
             />
           </div>
+          )}
 
-          <div>
+          {isElementVisible('stock-reports-el-filter-date-to') && (
+            <div>
             <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Updated To</label>
             <input
               type="date"
@@ -412,8 +639,10 @@ export default function StockReports() {
               className="mt-1.5 block w-full rounded-xl border border-orange-100 bg-gradient-to-b from-white to-orange-50/30 px-3.5 py-2.5 text-sm text-gray-900 shadow-sm transition-all duration-200 focus:border-orange-400 focus:ring-4 focus:ring-orange-100 focus:outline-none"
             />
           </div>
+          )}
 
-          <div className="md:col-span-2 lg:col-span-4 xl:col-span-6 flex justify-end">
+          {isElementVisible('stock-reports-el-btn-reset-filters') && (
+            <div className="md:col-span-2 lg:col-span-4 xl:col-span-6 flex justify-end">
             <button
               onClick={resetFilters}
               className="rounded-full border border-orange-200 bg-orange-50 px-4 py-2 text-sm font-semibold text-orange-700 transition hover:bg-orange-100"
@@ -421,14 +650,32 @@ export default function StockReports() {
               Reset Filters
             </button>
           </div>
+          )}
         </div>
       </div>
+      )}
 
-      <div className="overflow-hidden rounded-2xl border border-orange-100 bg-white shadow-[0_18px_65px_-35px_rgba(194,65,12,0.42)]">
+      {isElementVisible('stock-reports-sec-table') && (
+        <div className="relative overflow-hidden rounded-2xl border border-orange-100 bg-white shadow-[0_18px_65px_-35px_rgba(194,65,12,0.42)]">
+        {showWidgetCloseButtons && (
+          <button
+            type="button"
+            onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-sec-table', true); }}
+            className="absolute right-3 top-3 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+            title="Hide report table section"
+            aria-label="Hide report table section"
+          >
+            x
+          </button>
+        )}
         <div className="border-b border-orange-100 bg-gradient-to-r from-slate-900 via-orange-900 to-amber-800 px-5 py-3.5">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <h4 className="text-sm font-semibold uppercase tracking-[0.2em] text-amber-100">Stock Report Table</h4>
-            <p className="text-xs text-amber-100/85">Total Value: LKR {reportValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+            {isElementVisible('stock-reports-el-title-table') && (
+              <h4 className="text-sm font-semibold uppercase tracking-[0.2em] text-amber-100">Stock Report Table</h4>
+            )}
+            {isElementVisible('stock-reports-el-total-value') && (
+              <p className="text-xs text-amber-100/85">Total Value: LKR {reportValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+            )}
           </div>
         </div>
 
@@ -447,13 +694,118 @@ export default function StockReports() {
             <table className="min-w-full divide-y divide-slate-200">
               <thead className="bg-slate-100/80">
                 <tr>
-                  <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Item</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Type</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Stock</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Price</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Supplier</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Status</th>
-                  <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Updated</th>
+                  {isColumnVisible('stock-reports-col-item') && (
+                    <th className="relative px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                      Item
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-col-item', true); }}
+                          className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                          title="Hide item column"
+                          aria-label="Hide item column"
+                        >
+                          x
+                        </button>
+                      )}
+                    </th>
+                  )}
+                  {isColumnVisible('stock-reports-col-type') && (
+                    <th className="relative px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                      Type
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-col-type', true); }}
+                          className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                          title="Hide type column"
+                          aria-label="Hide type column"
+                        >
+                          x
+                        </button>
+                      )}
+                    </th>
+                  )}
+                  {isColumnVisible('stock-reports-col-stock') && (
+                    <th className="relative px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                      Stock
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-col-stock', true); }}
+                          className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                          title="Hide stock column"
+                          aria-label="Hide stock column"
+                        >
+                          x
+                        </button>
+                      )}
+                    </th>
+                  )}
+                  {isColumnVisible('stock-reports-col-price') && (
+                    <th className="relative px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                      Price
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-col-price', true); }}
+                          className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                          title="Hide price column"
+                          aria-label="Hide price column"
+                        >
+                          x
+                        </button>
+                      )}
+                    </th>
+                  )}
+                  {isColumnVisible('stock-reports-col-supplier') && (
+                    <th className="relative px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                      Supplier
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-col-supplier', true); }}
+                          className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                          title="Hide supplier column"
+                          aria-label="Hide supplier column"
+                        >
+                          x
+                        </button>
+                      )}
+                    </th>
+                  )}
+                  {isColumnVisible('stock-reports-col-status') && (
+                    <th className="relative px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                      Status
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-col-status', true); }}
+                          className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                          title="Hide status column"
+                          aria-label="Hide status column"
+                        >
+                          x
+                        </button>
+                      )}
+                    </th>
+                  )}
+                  {isColumnVisible('stock-reports-col-updated') && (
+                    <th className="relative px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+                      Updated
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleStockReportsVisibilityToggle('stock-reports-col-updated', true); }}
+                          className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                          title="Hide updated column"
+                          aria-label="Hide updated column"
+                        >
+                          x
+                        </button>
+                      )}
+                    </th>
+                  )}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 bg-white">
@@ -461,87 +813,108 @@ export default function StockReports() {
                   const stockMeta = getStockStatus(item);
                   return (
                     <tr key={item.id} className="transition hover:bg-orange-50/40">
-                      <td className="px-4 py-3.5 text-sm text-slate-700">
-                        <p className="font-semibold text-slate-900">{item.name}</p>
-                        <p className="text-xs text-slate-500">{item.code} • {item.category || 'Uncategorized'}</p>
-                      </td>
-                      <td className="px-4 py-3.5 text-sm text-slate-700">
-                        {item.type === 'raw_material' ? 'Raw Material' : 'Finished Good'}
-                      </td>
-                      <td className="px-4 py-3.5 text-sm text-slate-700">
-                        <p>{item.current_stock.toFixed(2)} {item.unit}</p>
-                        <p className="text-xs text-slate-500">Min: {item.minimum_stock.toFixed(2)}</p>
-                      </td>
-                      <td className="px-4 py-3.5 text-sm font-semibold text-slate-900">
-                        LKR {resolvePrice(item).toFixed(2)}
-                      </td>
-                      <td className="px-4 py-3.5 text-sm text-slate-700">
-                        {item.supplier_name || 'N/A'}
-                      </td>
-                      <td className="px-4 py-3.5 text-sm text-slate-700">
-                        <div className="flex items-center gap-2">
-                          <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${stockMeta.color}`}>
-                            {stockMeta.label}
-                          </span>
-                          <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${item.status === 'active' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-300 bg-slate-100 text-slate-600'}`}>
-                            {item.status}
-                          </span>
-                        </div>
-                      </td>
-                      <td className="px-4 py-3.5 text-sm text-slate-600">
-                        {item.updated_at ? new Date(item.updated_at).toLocaleDateString() : 'N/A'}
-                      </td>
+                      {isColumnVisible('stock-reports-col-item') && (
+                        <td className="px-4 py-3.5 text-sm text-slate-700">
+                          <p className="font-semibold text-slate-900">{item.name}</p>
+                          <p className="text-xs text-slate-500">{item.code} • {item.category || 'Uncategorized'}</p>
+                        </td>
+                      )}
+                      {isColumnVisible('stock-reports-col-type') && (
+                        <td className="px-4 py-3.5 text-sm text-slate-700">
+                          {item.type === 'raw_material' ? 'Raw Material' : 'Finished Good'}
+                        </td>
+                      )}
+                      {isColumnVisible('stock-reports-col-stock') && (
+                        <td className="px-4 py-3.5 text-sm text-slate-700">
+                          <p>{item.current_stock.toFixed(2)} {item.unit}</p>
+                          <p className="text-xs text-slate-500">Min: {item.minimum_stock.toFixed(2)}</p>
+                        </td>
+                      )}
+                      {isColumnVisible('stock-reports-col-price') && (
+                        <td className="px-4 py-3.5 text-sm font-semibold text-slate-900">
+                          LKR {resolvePrice(item).toFixed(2)}
+                        </td>
+                      )}
+                      {isColumnVisible('stock-reports-col-supplier') && (
+                        <td className="px-4 py-3.5 text-sm text-slate-700">
+                          {item.supplier_name || 'N/A'}
+                        </td>
+                      )}
+                      {isColumnVisible('stock-reports-col-status') && (
+                        <td className="px-4 py-3.5 text-sm text-slate-700">
+                          <div className="flex items-center gap-2">
+                            <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${stockMeta.color}`}>
+                              {stockMeta.label}
+                            </span>
+                            <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${item.status === 'active' ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-300 bg-slate-100 text-slate-600'}`}>
+                              {item.status}
+                            </span>
+                          </div>
+                        </td>
+                      )}
+                      {isColumnVisible('stock-reports-col-updated') && (
+                        <td className="px-4 py-3.5 text-sm text-slate-600">
+                          {item.updated_at ? new Date(item.updated_at).toLocaleDateString() : 'N/A'}
+                        </td>
+                      )}
                     </tr>
                   );
                 })}
               </tbody>
             </table>
             </div>
-          <div className="flex flex-col gap-3 border-t border-orange-100 bg-orange-50/50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-            <p className="text-sm text-slate-600">
-              Showing {filteredItems.length === 0 ? 0 : startIndex + 1} to {endIndex} of {filteredItems.length} records
-            </p>
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="flex items-center gap-2">
-                <label className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Rows</label>
-                <select
-                  value={pageSize}
-                  onChange={(e) => {
-                    setPageSize(Number(e.target.value));
-                    setCurrentPage(1);
-                  }}
-                  className="rounded-lg border border-orange-200 bg-white px-2 py-1.5 text-sm text-slate-700"
-                >
-                  <option value={10}>10</option>
-                  <option value={25}>25</option>
-                  <option value={50}>50</option>
-                  <option value={100}>100</option>
-                </select>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
-                  disabled={safeCurrentPage <= 1}
-                  className="rounded-full border border-orange-200 bg-white px-3.5 py-1.5 text-sm font-semibold text-orange-700 transition hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  Previous
-                </button>
-                <span className="text-sm font-semibold text-slate-700">
-                  Page {safeCurrentPage} of {totalPages}
-                </span>
-                <button
-                  onClick={() => setCurrentPage((prev) => Math.min(totalPages, prev + 1))}
-                  disabled={safeCurrentPage >= totalPages}
-                  className="rounded-full border border-orange-200 bg-white px-3.5 py-1.5 text-sm font-semibold text-orange-700 transition hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  Next
-                </button>
+          {isElementVisible('stock-reports-sec-pagination') && (
+            <div className="flex flex-col gap-3 border-t border-orange-100 bg-orange-50/50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-sm text-slate-600">
+                Showing {filteredItems.length === 0 ? 0 : startIndex + 1} to {endIndex} of {filteredItems.length} records
+              </p>
+              <div className="flex flex-wrap items-center gap-3">
+                {isElementVisible('stock-reports-el-rows-selector') && (
+                  <div className="flex items-center gap-2">
+                    <label className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Rows</label>
+                    <select
+                      value={pageSize}
+                      onChange={(e) => {
+                        setPageSize(Number(e.target.value));
+                        setCurrentPage(1);
+                      }}
+                      className="rounded-lg border border-orange-200 bg-white px-2 py-1.5 text-sm text-slate-700"
+                    >
+                      <option value={10}>10</option>
+                      <option value={25}>25</option>
+                      <option value={50}>50</option>
+                      <option value={100}>100</option>
+                    </select>
+                  </div>
+                )}
+                {isElementVisible('stock-reports-el-pagination-controls') && (
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
+                      disabled={safeCurrentPage <= 1}
+                      className="rounded-full border border-orange-200 bg-white px-3.5 py-1.5 text-sm font-semibold text-orange-700 transition hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Previous
+                    </button>
+                    <span className="text-sm font-semibold text-slate-700">
+                      Page {safeCurrentPage} of {totalPages}
+                    </span>
+                    <button
+                      onClick={() => setCurrentPage((prev) => Math.min(totalPages, prev + 1))}
+                      disabled={safeCurrentPage >= totalPages}
+                      className="rounded-full border border-orange-200 bg-white px-3.5 py-1.5 text-sm font-semibold text-orange-700 transition hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Next
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
-          </div>
+          )}
           </>
         )}
       </div>
+      )}
     </div>
   );
 }

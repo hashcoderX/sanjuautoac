@@ -7,9 +7,9 @@ import axios from 'axios';
 
 export default function HRM() {
   const [token, setToken] = useState('');
-  const [userRoles, setUserRoles] = useState<string[]>([]);
-  const [userPermissions, setUserPermissions] = useState<string[]>([]);
-  const [isAdminUser, setIsAdminUser] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [accessReady, setAccessReady] = useState(false);
   const [activeEmployees, setActiveEmployees] = useState(0);
   const [attendanceRate, setAttendanceRate] = useState(0);
@@ -18,12 +18,38 @@ export default function HRM() {
   const [totalEmployees, setTotalEmployees] = useState(0);
   const [todayAttendance, setTodayAttendance] = useState(0);
   const [pendingLeaves, setPendingLeaves] = useState(0);
+  const [candidatesCount, setCandidatesCount] = useState(0);
   const [totalPayrolls, setTotalPayrolls] = useState(0);
   const [pendingPayrolls, setPendingPayrolls] = useState(0);
   const [processedPayrolls, setProcessedPayrolls] = useState(0);
   const [loading, setLoading] = useState(true);
   const router = useRouter();
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+
+  useEffect(() => {
+    const stored = localStorage.getItem('widgets_fixed_global');
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === 'widgets_fixed_global') {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
 
   useEffect(() => {
     const storedToken = localStorage.getItem('token');
@@ -43,48 +69,22 @@ export default function HRM() {
 
   const fetchAccessProfile = async () => {
     try {
-      const userRes = await axios.get(`${API_URL}/api/user`, {
+      const visibilityRes = await axios.get(`${API_URL}/api/feature-visibility`, {
         headers: { Authorization: `Bearer ${token}` },
       });
 
-      const userData = userRes.data || {};
-      const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
-
-      const roleNames = [
-        String(userData?.role || ''),
-        ...(Array.isArray(userData?.roles)
-          ? userData.roles.map((role: any) => String(role?.name || role || ''))
-          : []),
-      ]
-        .map((role) => role.trim().toLowerCase())
-        .filter(Boolean);
-
-      const permissionNames = Array.isArray(userData?.roles)
-        ? userData.roles.flatMap((role: any) =>
-            Array.isArray(role?.permissions)
-              ? role.permissions.map((permission: any) =>
-                  String(permission?.name || '').trim().toLowerCase()
-                )
-              : []
-          )
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
         : [];
 
-      const roleBlob = roleNames.join(' ');
-      const adminUser =
-        !employeeId ||
-        roleBlob.includes('super admin') ||
-        roleBlob.includes('superadmin') ||
-        roleBlob.includes('administrator') ||
-        roleBlob.includes('admin');
-
-      setUserRoles(Array.from(new Set(roleNames)));
-      setUserPermissions(Array.from(new Set(permissionNames.filter(Boolean))));
-      setIsAdminUser(adminUser);
+      setCanManageFeatureVisibility(Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
     } catch (error) {
       console.error('Error fetching HRM access profile:', error);
-      setUserRoles([]);
-      setUserPermissions([]);
-      setIsAdminUser(false);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
     } finally {
       setAccessReady(true);
     }
@@ -155,6 +155,15 @@ export default function HRM() {
       const pendingLeavesCount = Array.isArray(leavesData) ? leavesData.length : 0;
       setPendingLeaves(pendingLeavesCount);
 
+      // Fetch candidates count
+      const candidatesResponse = await axios.get(`${API_URL}/api/hr/candidates`, {
+        headers: { Authorization: `Bearer ${token}` },
+        params: { per_page: 1000 }
+      });
+      const candidatesData = candidatesResponse.data.data || candidatesResponse.data;
+      const totalCandidatesCount = Array.isArray(candidatesData) ? candidatesData.length : 0;
+      setCandidatesCount(totalCandidatesCount);
+
       // Fetch payroll statistics
       const payrollsResponse = await axios.get(`${API_URL}/api/hr/payrolls`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -182,6 +191,7 @@ export default function HRM() {
       setTotalEmployees(0);
       setTodayAttendance(0);
       setPendingLeaves(0);
+      setCandidatesCount(0);
       setTotalPayrolls(0);
       setPendingPayrolls(0);
       setProcessedPayrolls(0);
@@ -190,98 +200,131 @@ export default function HRM() {
     }
   };
 
-  const hasAnyPermission = (keywords: string[]) => {
-    if (isAdminUser) return true;
-    return userPermissions.some((permission) => keywords.some((keyword) => permission.includes(keyword)));
-  };
-
   const hrmModules = [
     {
+      id: 'hrm-employees',
       name: 'Employees',
       icon: '👥',
       path: '/dashboard/hrm/employees',
       description: 'Manage employee records',
       color: 'from-blue-500 to-cyan-500',
       bgColor: 'from-blue-50 to-cyan-50',
-      getStats: () => loading ? '...' : `${totalEmployees} Employees`,
-      accessKeywords: ['view_employees', 'create_employees', 'edit_employees', 'delete_employees']
+      getStats: () => loading ? '...' : `${totalEmployees} Employees`
     },
     {
+      id: 'hrm-departments',
       name: 'Departments',
       icon: '🏢',
       path: '/dashboard/hrm/departments',
       description: 'Manage company departments',
       color: 'from-green-500 to-emerald-500',
       bgColor: 'from-green-50 to-emerald-50',
-      getStats: () => loading ? '...' : `${departmentsCount} Departments`,
-      accessKeywords: ['view_departments', 'create_departments', 'edit_departments', 'delete_departments']
+      getStats: () => loading ? '...' : `${departmentsCount} Departments`
     },
     {
+      id: 'hrm-designations',
       name: 'Designations',
       icon: '👔',
       path: '/dashboard/hrm/designations',
       description: 'Manage job positions',
       color: 'from-purple-500 to-indigo-500',
       bgColor: 'from-purple-50 to-indigo-50',
-      getStats: () => loading ? '...' : `${designationsCount} Positions`,
-      accessKeywords: ['view_designations', 'create_designations', 'edit_designations', 'delete_designations']
+      getStats: () => loading ? '...' : `${designationsCount} Positions`
     },
     {
+      id: 'hrm-attendance',
       name: 'Attendance',
       icon: '📅',
       path: '/dashboard/hrm/attendance',
       description: 'Track employee attendance',
       color: 'from-orange-500 to-red-500',
       bgColor: 'from-orange-50 to-red-50',
-      getStats: () => loading ? '...' : `${todayAttendance} Marked Today`,
-      accessKeywords: ['view_attendance', 'create_attendance', 'edit_attendance', 'delete_attendance']
+      getStats: () => loading ? '...' : `${todayAttendance} Marked Today`
     },
     {
+      id: 'hrm-leaves',
       name: 'Leaves',
       icon: '🏖️',
       path: '/dashboard/hrm/leaves',
       description: 'Manage leave requests',
       color: 'from-teal-500 to-green-500',
       bgColor: 'from-teal-50 to-green-50',
-      getStats: () => loading ? '...' : `${pendingLeaves} Pending Requests`,
-      accessKeywords: ['view_leaves', 'create_leaves', 'approve_leaves', 'reject_leaves']
+      getStats: () => loading ? '...' : `${pendingLeaves} Pending Requests`
     },
     {
+      id: 'hrm-candidates',
+      name: 'Candidates',
+      icon: '🎯',
+      path: '/dashboard/hrm/candidates',
+      description: 'Manage candidate pipeline and interviews',
+      color: 'from-pink-500 to-rose-500',
+      bgColor: 'from-pink-50 to-rose-50',
+      getStats: () => loading ? '...' : `${candidatesCount} Candidates`
+    },
+    {
+      id: 'hrm-roles',
       name: 'Roles & Privileges',
       icon: '🔐',
       path: '/dashboard/hrm/roles',
       description: 'Manage user roles and permissions',
       color: 'from-indigo-500 to-purple-500',
       bgColor: 'from-indigo-50 to-purple-50',
-      getStats: () => loading ? '...' : 'Access Control',
-      accessKeywords: ['view_roles', 'create_roles', 'edit_roles', 'delete_roles', 'assign_roles', 'view_permissions', 'create_permissions', 'edit_permissions', 'delete_permissions']
+      getStats: () => loading ? '...' : 'Access Control'
     },
     {
+      id: 'hrm-payroll',
       name: 'Payroll',
       icon: '💰',
       path: '/dashboard/hrm/payroll',
       description: 'Process payroll and salaries',
       color: 'from-yellow-500 to-orange-500',
       bgColor: 'from-yellow-50 to-orange-50',
-      getStats: () => loading ? '...' : `${pendingPayrolls} Pending`,
-      accessKeywords: ['view_payrolls', 'create_payrolls', 'edit_payrolls', 'delete_payrolls']
+      getStats: () => loading ? '...' : `${pendingPayrolls} Pending`
     },
   ];
 
-  const isSalesRefOnly =
-    !isAdminUser && userRoles.length > 0 && userRoles.every((role) => role === 'sales ref');
+  const handleFeatureVisibilityToggle = async (moduleId: string, nextHiddenState: boolean) => {
+    if (!canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleId,
+          hidden: nextHiddenState,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Unable to update HRM widget visibility:', error);
+      alert('Unable to update widget visibility. Please try again.');
+    }
+  };
 
   const visibleHrmModules = hrmModules.filter((module) => {
-    if (isAdminUser) return true;
-    if (module.name === 'Leaves') {
-      // All employees should be able to open leave requests.
-      return true;
-    }
-    if (isSalesRefOnly) {
-      return module.name === 'Leaves';
-    }
-    return hasAnyPermission(module.accessKeywords);
+    return !hiddenModules.includes(module.id);
   });
+
+  const quickActions = [
+    { id: 'hrm-quick-add-employee', icon: '➕', title: 'Add Employee', desc: 'New hire' },
+    { id: 'hrm-quick-view-reports', icon: '📊', title: 'View Reports', desc: 'Analytics' },
+    { id: 'hrm-quick-mark-attendance', icon: '📅', title: 'Mark Attendance', desc: 'Daily check-in' },
+    { id: 'hrm-quick-process-payroll', icon: '💰', title: 'Process Payroll', desc: 'Monthly run' },
+  ];
+
+  const visibleQuickActions = quickActions.filter((action) => !hiddenModules.includes(action.id));
 
   const handleLogout = () => {
     localStorage.removeItem('token');
@@ -384,6 +427,25 @@ export default function HRM() {
               href={module.path}
               className="group relative bg-white/70 backdrop-blur-sm rounded-2xl shadow-lg hover:shadow-2xl transition-all duration-500 cursor-pointer border border-white/20 overflow-hidden transform hover:-translate-y-2 hover:scale-105"
             >
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    void handleFeatureVisibilityToggle(module.id, true);
+                  }}
+                  className="absolute top-3 right-3 z-20 flex h-8 w-8 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                  title="Disable widget"
+                  aria-label="Disable widget"
+                >
+                  <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M18 6 6 18" />
+                    <path d="m6 6 12 12" />
+                  </svg>
+                </button>
+              )}
+
               {/* Gradient Background */}
               <div className={`absolute inset-0 bg-gradient-to-br ${module.bgColor} opacity-0 group-hover:opacity-100 transition-opacity duration-500`}></div>
 
@@ -422,7 +484,7 @@ export default function HRM() {
 
         {visibleHrmModules.length === 0 && (
           <div className="mt-6 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
-            No HRM features are assigned to your role yet. Please contact an administrator.
+            No HRM feature widgets are currently visible. Please contact an administrator.
           </div>
         )}
 
@@ -442,16 +504,30 @@ export default function HRM() {
 
           <div className="p-6">
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              {[
-                { icon: '➕', title: 'Add Employee', desc: 'New hire' },
-                { icon: '📊', title: 'View Reports', desc: 'Analytics' },
-                { icon: '📅', title: 'Mark Attendance', desc: 'Daily check-in' },
-                { icon: '💰', title: 'Process Payroll', desc: 'Monthly run' },
-              ].map((action, index) => (
+              {visibleQuickActions.map((action, index) => (
                 <div
                   key={index}
-                  className="group bg-white/50 hover:bg-white/80 rounded-xl p-4 border border-white/30 hover:border-white/50 transition-all duration-300 cursor-pointer transform hover:scale-105 text-center"
+                  className="group relative bg-white/50 hover:bg-white/80 rounded-xl p-4 border border-white/30 hover:border-white/50 transition-all duration-300 cursor-pointer transform hover:scale-105 text-center"
                 >
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        void handleFeatureVisibilityToggle(action.id, true);
+                      }}
+                      className="absolute top-2 right-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Disable widget"
+                      aria-label="Disable widget"
+                    >
+                      <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+
                   <div className="text-2xl mb-2">{action.icon}</div>
                   <h4 className="font-semibold text-gray-900 group-hover:text-gray-800 transition-colors duration-300 text-sm">
                     {action.title}
@@ -462,6 +538,11 @@ export default function HRM() {
                 </div>
               ))}
             </div>
+            {visibleQuickActions.length === 0 && (
+              <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+                All quick action widgets are currently hidden.
+              </div>
+            )}
           </div>
         </div>
       </main>

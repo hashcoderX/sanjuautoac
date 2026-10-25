@@ -8,6 +8,8 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 class DeliveryCashTransaction extends Model
 {
     protected $fillable = [
+        'tenant_id',
+        'branch_id',
         'date',
         'type',
         'amount',

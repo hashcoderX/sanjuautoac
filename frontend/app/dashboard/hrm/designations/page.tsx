@@ -12,9 +12,14 @@ interface Designation {
   updated_at: string;
 }
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
 export default function Designations() {
   const [token, setToken] = useState('');
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [designations, setDesignations] = useState<Designation[]>([]);
   const [loading, setLoading] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
@@ -27,10 +32,114 @@ export default function Designations() {
   const [messageModalBody, setMessageModalBody] = useState('');
   const [messageModalType, setMessageModalType] = useState<'error' | 'success'>('error');
   const router = useRouter();
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+
+  const isColumnVisible = (key: string) => !hiddenModules.includes(key);
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
 
   // Form fields
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
+
+  useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchAccessProfile = async (authToken: string) => {
+    try {
+      const [userRes, visibilityRes] = await Promise.all([
+        axios.get(`${API_URL}/api/user`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+      ]);
+
+      const superAdmin = isSuperAdminUser(userRes.data || {});
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching designation page visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleDesignationVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating designation widget visibility:', error);
+      setMessageModalType('error');
+      setMessageModalTitle('Update Failed');
+      setMessageModalBody('Unable to update widget visibility. Please try again.');
+      setShowMessageModal(true);
+    }
+  };
 
   useEffect(() => {
     const storedToken = localStorage.getItem('token');
@@ -39,6 +148,7 @@ export default function Designations() {
     } else {
       setToken(storedToken);
       setApiError(null);
+      fetchAccessProfile(storedToken);
       fetchDesignations(storedToken);
     }
   }, [router]);
@@ -196,20 +306,52 @@ export default function Designations() {
         )}
         <div className="mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-6">
           <div>
-            <div className="flex items-center space-x-3 mb-4">
-              <div className="w-12 h-12 bg-gradient-to-r from-blue-500 to-cyan-500 rounded-xl flex items-center justify-center text-2xl shadow-lg">
-                🏷️
+            {isElementVisible('hrm-designations-el-title') && (
+              <div className="relative flex items-center space-x-3 mb-4">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handleDesignationVisibilityToggle('hrm-designations-el-title', true); }}
+                    className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide section"
+                    aria-label="Hide title section"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
+                <div className="w-12 h-12 bg-gradient-to-r from-blue-500 to-cyan-500 rounded-xl flex items-center justify-center text-2xl shadow-lg">
+                  🏷️
+                </div>
+                <div>
+                  <h2 className="text-2xl sm:text-3xl md:text-4xl font-bold text-gray-900">Designation Management</h2>
+                  <p className="text-sm sm:text-base md:text-lg text-gray-600">Manage job positions and titles</p>
+                </div>
               </div>
-              <div>
-                <h2 className="text-2xl sm:text-3xl md:text-4xl font-bold text-gray-900">Designation Management</h2>
-                <p className="text-sm sm:text-base md:text-lg text-gray-600">Manage job positions and titles</p>
-              </div>
-            </div>
+            )}
             <div className="flex flex-col sm:flex-row gap-4 sm:space-x-6 sm:gap-0 mt-2 sm:mt-4">
-              <div className="text-center">
-                <div className="text-xl sm:text-2xl font-bold text-blue-600">{designations.length}</div>
-                <div className="text-sm text-gray-500">Total Designations</div>
-              </div>
+              {isElementVisible('hrm-designations-el-stat-total') && (
+                <div className="relative text-center">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleDesignationVisibilityToggle('hrm-designations-el-stat-total', true); }}
+                      className="absolute -top-2 -right-3 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide stat"
+                      aria-label="Hide total designations stat"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  <div className="text-xl sm:text-2xl font-bold text-blue-600">{designations.length}</div>
+                  <div className="text-sm text-gray-500">Total Designations</div>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -281,7 +423,22 @@ export default function Designations() {
           </div>
         )}
 
-        <div className="bg-white/80 backdrop-blur-lg rounded-2xl shadow-xl border border-white/20 overflow-hidden">
+        {isElementVisible('hrm-designations-sec-table') && (
+        <div className="relative bg-white/80 backdrop-blur-lg rounded-2xl shadow-xl border border-white/20 overflow-hidden">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleDesignationVisibilityToggle('hrm-designations-sec-table', true); }}
+              className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide section"
+              aria-label="Hide table section"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
           <div className="px-6 py-4 border-b border-gray-200 bg-gradient-to-r from-blue-50 to-cyan-50">
             <h3 className="text-lg font-semibold text-gray-900 flex items-center space-x-2">
               <svg className="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -294,35 +451,96 @@ export default function Designations() {
             <table className="min-w-full divide-y divide-gray-200">
               <thead className="bg-gradient-to-r from-gray-50 to-gray-100">
                 <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">
-                    Name
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">
-                    Description
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">
-                    Created
-                  </th>
+                  {isColumnVisible('hrm-designations-col-name') && (
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Name</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleDesignationVisibilityToggle('hrm-designations-col-name', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Name column"
+                            aria-label="Hide Name column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-designations-col-description') && (
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Description</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleDesignationVisibilityToggle('hrm-designations-col-description', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Description column"
+                            aria-label="Hide Description column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-designations-col-created') && (
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Created</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleDesignationVisibilityToggle('hrm-designations-col-created', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Created column"
+                            aria-label="Hide Created column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
                 {designations.map((designation) => (
                   <tr key={designation.id} className="hover:bg-gray-50 transition-colors duration-200">
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-semibold text-gray-900">
-                      {designation.name}
-                    </td>
-                    <td className="px-6 py-4 text-sm text-gray-900">
-                      {designation.description || 'No description'}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      {new Date(designation.created_at).toLocaleDateString()}
-                    </td>
+                    {isColumnVisible('hrm-designations-col-name') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm font-semibold text-gray-900">
+                        {designation.name}
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-designations-col-description') && (
+                      <td className="px-6 py-4 text-sm text-gray-900">
+                        {designation.description || 'No description'}
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-designations-col-created') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        {new Date(designation.created_at).toLocaleDateString()}
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         </div>
+        )}
 
         {showDeleteModal && (
           <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[60] flex items-center justify-center p-4">

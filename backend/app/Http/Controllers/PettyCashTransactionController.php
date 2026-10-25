@@ -9,9 +9,38 @@ use Illuminate\Support\Facades\Validator;
 
 class PettyCashTransactionController extends Controller
 {
+    private function tenantContext(Request $request): array
+    {
+        $user = $request->user();
+        $tenantId = (int) $request->input(
+            'tenant_id',
+            $request->attributes->get('tenant_id')
+                ?? $user?->employee?->tenant_id
+                ?? $user?->branch_id
+                ?? 0
+        );
+        $branchId = (int) $request->input(
+            'branch_id',
+            $request->attributes->get('branch_id')
+                ?? $user?->employee?->branch_id
+                ?? $user?->branch_id
+                ?? 0
+        );
+
+        return [$tenantId, $branchId];
+    }
+
     public function index(Request $request): JsonResponse
     {
+        [$tenantId, $branchId] = $this->tenantContext($request);
         $query = PettyCashTransaction::query();
+
+        if ($tenantId > 0) {
+            $query->where('tenant_id', $tenantId);
+        }
+        if ($branchId > 0) {
+            $query->where('branch_id', $branchId);
+        }
 
         if ($request->filled('type')) {
             $query->where('type', $request->input('type'));
@@ -39,6 +68,14 @@ class PettyCashTransactionController extends Controller
 
     public function store(Request $request): JsonResponse
     {
+        [$tenantId, $branchId] = $this->tenantContext($request);
+        if ($tenantId <= 0 || $branchId <= 0) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Tenant context is missing.',
+            ], 422);
+        }
+
         $validator = Validator::make($request->all(), [
             'date' => 'required|date',
             'type' => 'required|in:in,out',
@@ -58,6 +95,8 @@ class PettyCashTransactionController extends Controller
         $payload = $validator->validated();
 
         $transaction = PettyCashTransaction::create([
+            'tenant_id' => $tenantId,
+            'branch_id' => $branchId,
             'date' => $payload['date'],
             'type' => $payload['type'],
             'amount' => $payload['amount'],
@@ -73,9 +112,19 @@ class PettyCashTransactionController extends Controller
         ], 201);
     }
 
-    public function destroy(string $id): JsonResponse
+    public function destroy(Request $request, string $id): JsonResponse
     {
-        $transaction = PettyCashTransaction::find($id);
+        [$tenantId, $branchId] = $this->tenantContext($request);
+
+        $query = PettyCashTransaction::query();
+        if ($tenantId > 0) {
+            $query->where('tenant_id', $tenantId);
+        }
+        if ($branchId > 0) {
+            $query->where('branch_id', $branchId);
+        }
+
+        $transaction = $query->find($id);
 
         if (!$transaction) {
             return response()->json([

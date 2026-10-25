@@ -1,14 +1,14 @@
-import type { Metadata, Viewport } from "next";
-import "./globals.css";
+import type { Metadata, Viewport } from 'next';
+import './globals.css';
 
 export const metadata: Metadata = {
-  title: "BMS - Business Management System",
-  description: "Modern Business Management System with HRM",
+  title: "ServiceOS",
+  description: "ServiceOS - Modern Business Management System with HRM",
   manifest: "/manifest.webmanifest",
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
-    title: "BMS ERP",
+    title: "ServiceOS",
   },
   icons: {
     icon: "/pabasara sweets.jpeg",

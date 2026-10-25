@@ -103,15 +103,9 @@ export default function InterviewReportPage() {
 
         const hasReportPermission = permissionNames.some((permission: string) => permission.includes('report'));
 
-        if (!isAdminUser && !hasReportPermission) {
-          router.push('/dashboard');
-          return;
-        }
-
         await fetchInterviewRows(token);
       } catch (error) {
         console.error('Error checking interview report access:', error);
-        router.push('/dashboard');
       } finally {
         setAccessReady(true);
       }

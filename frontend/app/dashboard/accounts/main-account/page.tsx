@@ -273,6 +273,35 @@ export default function MainAccountPage() {
   const [withdrawSaving, setWithdrawSaving] = useState(false);
   const [withdrawError, setWithdrawError] = useState('');
   const [withdrawSuccess, setWithdrawSuccess] = useState('');
+  const [addCashSaving, setAddCashSaving] = useState(false);
+  const [modalAlert, setModalAlert] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    tone: 'success' | 'error' | 'warning' | 'info';
+  }>({
+    isOpen: false,
+    title: '',
+    message: '',
+    tone: 'info',
+  });
+  const [modalConfirm, setModalConfirm] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    confirmText: string;
+    cancelText: string;
+    onConfirm: null | (() => void | Promise<void>);
+    busy: boolean;
+  }>({
+    isOpen: false,
+    title: '',
+    message: '',
+    confirmText: 'Confirm',
+    cancelText: 'Cancel',
+    onConfirm: null,
+    busy: false,
+  });
   const [journalEntries, setJournalEntries] = useState<JournalEntry[]>([]);
   const [journalLoading, setJournalLoading] = useState(false);
   const [pendingMainFundRequests, setPendingMainFundRequests] = useState<PendingMainFundRequest[]>([]);
@@ -309,9 +338,87 @@ export default function MainAccountPage() {
     note: '',
     debitAccount: 'Cash Withdrawal Expense',
   });
+  const [addCashForm, setAddCashForm] = useState({
+    companyId: '',
+    amount: '',
+    date: new Date().toISOString().split('T')[0],
+    reference: '',
+    note: '',
+  });
 
   const router = useRouter();
   const api = useMemo(() => createApiClient(token), [token]);
+
+  const openAlertModal = (
+    title: string,
+    message: string,
+    tone: 'success' | 'error' | 'warning' | 'info' = 'info'
+  ) => {
+    setModalAlert({
+      isOpen: true,
+      title,
+      message,
+      tone,
+    });
+  };
+
+  const closeAlertModal = () => {
+    setModalAlert((prev) => ({
+      ...prev,
+      isOpen: false,
+    }));
+  };
+
+  const openConfirmModal = (
+    title: string,
+    message: string,
+    onConfirm: () => void | Promise<void>,
+    confirmText = 'Confirm',
+    cancelText = 'Cancel'
+  ) => {
+    setModalConfirm({
+      isOpen: true,
+      title,
+      message,
+      confirmText,
+      cancelText,
+      onConfirm,
+      busy: false,
+    });
+  };
+
+  const closeConfirmModal = () => {
+    if (modalConfirm.busy) return;
+    setModalConfirm({
+      isOpen: false,
+      title: '',
+      message: '',
+      confirmText: 'Confirm',
+      cancelText: 'Cancel',
+      onConfirm: null,
+      busy: false,
+    });
+  };
+
+  const runConfirmAction = async () => {
+    if (!modalConfirm.onConfirm || modalConfirm.busy) return;
+
+    try {
+      setModalConfirm((prev) => ({ ...prev, busy: true }));
+      await modalConfirm.onConfirm();
+      setModalConfirm({
+        isOpen: false,
+        title: '',
+        message: '',
+        confirmText: 'Confirm',
+        cancelText: 'Cancel',
+        onConfirm: null,
+        busy: false,
+      });
+    } catch {
+      setModalConfirm((prev) => ({ ...prev, busy: false }));
+    }
+  };
 
   const extractDebitCredit = (note: string | null | undefined, fallbackType: 'in' | 'out') => {
     const narration = String(note || '');
@@ -685,6 +792,14 @@ export default function MainAccountPage() {
         companyId: String(rows[0].id),
       };
     });
+
+    setAddCashForm((prev) => {
+      if (prev.companyId) return prev;
+      return {
+        ...prev,
+        companyId: String(rows[0].id),
+      };
+    });
   }, [rows]);
 
   const summary = useMemo(() => {
@@ -728,6 +843,11 @@ export default function MainAccountPage() {
   const selectedWithdrawCompany = useMemo(
     () => rows.find((company) => String(company.id) === withdrawForm.companyId) || null,
     [rows, withdrawForm.companyId]
+  );
+
+  const selectedAddCashCompany = useMemo(
+    () => rows.find((company) => String(company.id) === addCashForm.companyId) || null,
+    [rows, addCashForm.companyId]
   );
 
   const availableWithdrawBankAccounts = useMemo(
@@ -988,19 +1108,19 @@ export default function MainAccountPage() {
   const handleAcceptMainFundRequest = async (requestId: string) => {
     const request = pendingMainFundRequests.find((entry) => entry.id === requestId);
     if (!request) {
-      setTransferError('Pending request not found.');
+      openAlertModal('Request Not Found', 'Pending request not found.', 'error');
       return;
     }
 
     const targetCompany = rows.find((company) => company.id === request.company_id);
     if (!targetCompany) {
-      setTransferError('Target company not found for this pending request.');
+      openAlertModal('Company Not Found', 'Target company not found for this pending request.', 'error');
       return;
     }
 
     const amount = Number(request.amount || 0);
     if (amount <= 0) {
-      setTransferError('Invalid pending request amount.');
+      openAlertModal('Invalid Amount', 'Invalid pending request amount.', 'error');
       return;
     }
 
@@ -1051,7 +1171,11 @@ export default function MainAccountPage() {
       });
 
       setJournalPage(1);
-      setTransferSuccess('Pending outlet transfer accepted and posted to main account.');
+      openAlertModal(
+        'Transfer Accepted',
+        'Pending outlet transfer accepted and posted to main account.',
+        'success'
+      );
     } catch (error) {
       if (isAxiosError(error) && error.response?.status === 401) {
         localStorage.removeItem('token');
@@ -1063,7 +1187,7 @@ export default function MainAccountPage() {
       const apiMessage =
         (isAxiosError(error) && (error.response?.data?.message as string)) ||
         'Failed to accept pending transfer.';
-      setTransferError(apiMessage);
+      openAlertModal('Accept Failed', apiMessage, 'error');
     } finally {
       setAcceptingRequestId('');
     }
@@ -1074,13 +1198,13 @@ export default function MainAccountPage() {
     setTransferSuccess('');
 
     if (!selectedCompany) {
-      setTransferError('Please select a company.');
+      openAlertModal('Missing Company', 'Please select a company.', 'warning');
       return;
     }
 
     const amount = Number(transferForm.amount || 0);
     if (Number.isNaN(amount) || amount <= 0) {
-      setTransferError('Transfer amount must be greater than zero.');
+      openAlertModal('Invalid Amount', 'Transfer amount must be greater than zero.', 'warning');
       return;
     }
 
@@ -1089,7 +1213,7 @@ export default function MainAccountPage() {
     const targetOutletAccount = transferForm.targetOutletAccount;
 
     if (targetLedger === 'outlet' && !selectedTransferOutlet) {
-      setTransferError('Please select the target outlet.');
+      openAlertModal('Missing Outlet', 'Please select the target outlet.', 'warning');
       return;
     }
 
@@ -1100,7 +1224,7 @@ export default function MainAccountPage() {
 
     if (sourceType === 'cash') {
       if (nextCashBalance < amount) {
-        setTransferError('Insufficient cash balance for this transfer.');
+        openAlertModal('Insufficient Balance', 'Insufficient cash balance for this transfer.', 'error');
         return;
       }
       nextCashBalance -= amount;
@@ -1110,13 +1234,13 @@ export default function MainAccountPage() {
       );
 
       if (bankIndex < 0) {
-        setTransferError('Please select the source bank account.');
+        openAlertModal('Missing Bank Account', 'Please select the source bank account.', 'warning');
         return;
       }
 
       const bankBalance = Number(nextBankAccounts[bankIndex].current_balance || 0);
       if (bankBalance < amount) {
-        setTransferError('Insufficient selected bank balance for this transfer.');
+        openAlertModal('Insufficient Balance', 'Insufficient selected bank balance for this transfer.', 'error');
         return;
       }
 
@@ -1176,7 +1300,7 @@ export default function MainAccountPage() {
         await persistLedgerEntry(targetLedgerKey, targetApiEndpoint, transferInEntry);
       } else {
         if (!selectedTransferOutlet) {
-          setTransferError('Please select the target outlet.');
+          openAlertModal('Missing Outlet', 'Please select the target outlet.', 'warning');
           return;
         }
 
@@ -1257,10 +1381,12 @@ export default function MainAccountPage() {
         note: '',
       }));
       setJournalPage(1);
-      setTransferSuccess(
+      openAlertModal(
+        'Transfer Posted',
         targetLedger === 'outlet'
           ? 'Transfer sent to outlet as pending. Outlet user must accept to update outlet account.'
-          : 'Transfer posted successfully using debit/credit journal treatment.'
+          : 'Transfer posted successfully using debit/credit journal treatment.',
+        'success'
       );
     } catch (error) {
       if (isAxiosError(error) && error.response?.status === 401) {
@@ -1274,7 +1400,7 @@ export default function MainAccountPage() {
         (isAxiosError(error) && (error.response?.data?.message as string)) ||
         'Failed to post transfer entry.';
 
-      setTransferError(apiMessage);
+      openAlertModal('Transfer Failed', apiMessage, 'error');
     } finally {
       setTransferSaving(false);
     }
@@ -1285,13 +1411,13 @@ export default function MainAccountPage() {
     setWithdrawSuccess('');
 
     if (!selectedWithdrawCompany) {
-      setWithdrawError('Please select a company.');
+      openAlertModal('Missing Company', 'Please select a company.', 'warning');
       return;
     }
 
     const amount = Number(withdrawForm.amount || 0);
     if (Number.isNaN(amount) || amount <= 0) {
-      setWithdrawError('Withdrawal amount must be greater than zero.');
+      openAlertModal('Invalid Amount', 'Withdrawal amount must be greater than zero.', 'warning');
       return;
     }
 
@@ -1302,7 +1428,7 @@ export default function MainAccountPage() {
 
     if (sourceType === 'cash') {
       if (nextCashBalance < amount) {
-        setWithdrawError('Insufficient cash balance for this withdrawal.');
+        openAlertModal('Insufficient Balance', 'Insufficient cash balance for this withdrawal.', 'error');
         return;
       }
       nextCashBalance -= amount;
@@ -1312,13 +1438,13 @@ export default function MainAccountPage() {
       );
 
       if (bankIndex < 0) {
-        setWithdrawError('Please select the source bank account.');
+        openAlertModal('Missing Bank Account', 'Please select the source bank account.', 'warning');
         return;
       }
 
       const bankBalance = Number(nextBankAccounts[bankIndex].current_balance || 0);
       if (bankBalance < amount) {
-        setWithdrawError('Insufficient selected bank balance for this withdrawal.');
+        openAlertModal('Insufficient Balance', 'Insufficient selected bank balance for this withdrawal.', 'error');
         return;
       }
 
@@ -1381,7 +1507,11 @@ export default function MainAccountPage() {
         note: '',
       }));
       setJournalPage(1);
-      setWithdrawSuccess('Withdrawal posted successfully with debit/credit journal entry.');
+      openAlertModal(
+        'Withdrawal Posted',
+        'Withdrawal posted successfully with debit/credit journal entry.',
+        'success'
+      );
     } catch (error) {
       if (isAxiosError(error) && error.response?.status === 401) {
         localStorage.removeItem('token');
@@ -1394,9 +1524,87 @@ export default function MainAccountPage() {
         (isAxiosError(error) && (error.response?.data?.message as string)) ||
         'Failed to post withdrawal entry.';
 
-      setWithdrawError(apiMessage);
+      openAlertModal('Withdrawal Failed', apiMessage, 'error');
     } finally {
       setWithdrawSaving(false);
+    }
+  };
+
+  const handleAddCash = async () => {
+    if (!selectedAddCashCompany) {
+      openAlertModal('Missing Company', 'Please select a company.', 'warning');
+      return;
+    }
+
+    const amount = Number(addCashForm.amount || 0);
+    if (Number.isNaN(amount) || amount <= 0) {
+      openAlertModal('Invalid Amount', 'Add cash amount must be greater than zero.', 'warning');
+      return;
+    }
+
+    const nextCashBalance = Number(selectedAddCashCompany.current_cash_balance || 0) + amount;
+
+    const payload = {
+      name: selectedAddCashCompany.name,
+      email: selectedAddCashCompany.email || '',
+      address: selectedAddCashCompany.address || null,
+      phone: selectedAddCashCompany.phone || null,
+      website: selectedAddCashCompany.website || null,
+      country: selectedAddCashCompany.country || null,
+      currency: selectedAddCashCompany.currency || null,
+      current_cash_balance: nextCashBalance,
+      current_bank_balance: Number(selectedAddCashCompany.current_bank_balance || 0),
+      current_cheque_balance: Number(selectedAddCashCompany.current_cheque_balance || 0),
+      bank_accounts: selectedAddCashCompany.bank_accounts || [],
+      cheque_accounts: selectedAddCashCompany.cheque_accounts || [],
+    };
+
+    try {
+      setAddCashSaving(true);
+      const res = await api.put(`/companies/${selectedAddCashCompany.id}`, payload);
+      const updatedCompany = res.data;
+
+      const nextRows = rows.map((company) =>
+        company.id === selectedAddCashCompany.id ? { ...company, ...updatedCompany } : company
+      );
+      setRows(nextRows);
+
+      const reference = addCashForm.reference.trim() || `CIN-${Date.now()}`;
+      const note = addCashForm.note.trim();
+
+      await api.post('/main-cash-transactions', {
+        date: addCashForm.date,
+        type: 'in',
+        amount,
+        reference,
+        note: note || 'Fund transfer received. Dr Main Cash Account, Cr Owner Capital.',
+      });
+
+      await refreshJournalFromBackend();
+
+      setAddCashForm((prev) => ({
+        ...prev,
+        amount: '',
+        reference: '',
+        note: '',
+      }));
+      setJournalPage(1);
+      openAlertModal('Cash Added', 'Cash added to main account successfully.', 'success');
+    } catch (error) {
+      if (isAxiosError(error) && error.response?.status === 401) {
+        localStorage.removeItem('token');
+        setToken('');
+        router.push('/');
+        return;
+      }
+
+      const apiMessage =
+        (isAxiosError(error) && (error.response?.data?.message as string)) ||
+        'Failed to add cash to main account.';
+
+      openAlertModal('Add Cash Failed', apiMessage, 'error');
+    } finally {
+      setAddCashSaving(false);
     }
   };
 
@@ -1491,18 +1699,84 @@ export default function MainAccountPage() {
 
         <section className="rounded-2xl border border-white/70 bg-white/90 backdrop-blur-lg shadow-[0_18px_65px_-35px_rgba(13,148,136,0.45)] p-5 space-y-4">
           <div>
+            <h2 className="text-lg font-semibold text-gray-900">Add Cash to Main Account (Funds In)</h2>
+            <p className="text-sm text-gray-600 mt-1">
+              Accounting entry: main cash account is <span className="font-semibold">Debit</span>, funding source is <span className="font-semibold">Credit</span>.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-6 gap-3">
+            <select
+              value={addCashForm.companyId}
+              onChange={(e) => setAddCashForm((prev) => ({ ...prev, companyId: e.target.value }))}
+              className="rounded-xl border border-gray-300 text-sm text-black px-3 py-2.5 md:col-span-2 shadow-sm"
+            >
+              <option value="">Select Company</option>
+              {rows.map((company) => (
+                <option key={company.id} value={String(company.id)}>
+                  {company.name}
+                </option>
+              ))}
+            </select>
+
+            <input
+              type="date"
+              value={addCashForm.date}
+              onChange={(e) => setAddCashForm((prev) => ({ ...prev, date: e.target.value }))}
+              className="rounded-xl border border-gray-300 text-sm text-black px-3 py-2.5 shadow-sm"
+            />
+
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={addCashForm.amount}
+              onChange={(e) => setAddCashForm((prev) => ({ ...prev, amount: e.target.value }))}
+              placeholder="Amount"
+              className="rounded-xl border border-gray-300 text-sm text-black px-3 py-2.5 shadow-sm"
+            />
+
+            <input
+              type="text"
+              value={addCashForm.reference}
+              onChange={(e) => setAddCashForm((prev) => ({ ...prev, reference: e.target.value }))}
+              placeholder="Reference"
+              className="rounded-xl border border-gray-300 text-sm text-black px-3 py-2.5 shadow-sm"
+            />
+
+            <button
+              type="button"
+              onClick={() =>
+                openConfirmModal(
+                  'Confirm Add Cash',
+                  'Do you want to post this cash-in transaction to the main account?',
+                  handleAddCash,
+                  'Post Cash In'
+                )
+              }
+              disabled={addCashSaving}
+              className="rounded-full bg-gradient-to-r from-emerald-600 to-cyan-600 text-white text-sm font-semibold px-5 py-2.5 hover:from-emerald-700 hover:to-cyan-700 disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {addCashSaving ? 'Posting...' : 'Post Cash In'}
+            </button>
+
+            <input
+              type="text"
+              value={addCashForm.note}
+              onChange={(e) => setAddCashForm((prev) => ({ ...prev, note: e.target.value }))}
+              placeholder="Narration (optional)"
+              className="rounded-xl border border-gray-300 text-sm text-black px-3 py-2.5 md:col-span-6 shadow-sm"
+            />
+          </div>
+        </section>
+
+        <section className="rounded-2xl border border-white/70 bg-white/90 backdrop-blur-lg shadow-[0_18px_65px_-35px_rgba(13,148,136,0.45)] p-5 space-y-4">
+          <div>
             <h2 className="text-lg font-semibold text-gray-900">Fund Transfer to Petty/Delivery/Outlet</h2>
             <p className="text-sm text-gray-600 mt-1">
               Accounting entry: target account is <span className="font-semibold">Debit</span>, source cash/bank is <span className="font-semibold">Credit</span>.
             </p>
           </div>
-
-          {transferError ? (
-            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{transferError}</div>
-          ) : null}
-          {transferSuccess ? (
-            <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">{transferSuccess}</div>
-          ) : null}
 
           <div className="grid grid-cols-1 md:grid-cols-8 gap-3">
             <select
@@ -1655,7 +1929,14 @@ export default function MainAccountPage() {
 
             <button
               type="button"
-              onClick={handleTransfer}
+              onClick={() =>
+                openConfirmModal(
+                  'Confirm Transfer',
+                  'Do you want to post this transfer transaction now?',
+                  handleTransfer,
+                  'Post Transfer'
+                )
+              }
               disabled={transferSaving}
               className="rounded-full bg-gradient-to-r from-emerald-600 to-teal-600 text-white text-sm font-semibold px-5 py-2.5 hover:from-emerald-700 hover:to-teal-700 disabled:opacity-60 disabled:cursor-not-allowed"
             >
@@ -1671,13 +1952,6 @@ export default function MainAccountPage() {
               Accounting entry: withdrawal/expense account is <span className="font-semibold">Debit</span>, source cash/bank is <span className="font-semibold">Credit</span>.
             </p>
           </div>
-
-          {withdrawError ? (
-            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{withdrawError}</div>
-          ) : null}
-          {withdrawSuccess ? (
-            <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">{withdrawSuccess}</div>
-          ) : null}
 
           <div className="grid grid-cols-1 md:grid-cols-8 gap-3">
             <select
@@ -1782,7 +2056,14 @@ export default function MainAccountPage() {
 
             <button
               type="button"
-              onClick={handleWithdraw}
+              onClick={() =>
+                openConfirmModal(
+                  'Confirm Withdrawal',
+                  'Do you want to post this withdrawal transaction now?',
+                  handleWithdraw,
+                  'Post Withdrawal'
+                )
+              }
               disabled={withdrawSaving}
               className="rounded-full bg-gradient-to-r from-rose-600 to-orange-600 text-white text-sm font-semibold px-5 py-2.5 hover:from-rose-700 hover:to-orange-700 disabled:opacity-60 disabled:cursor-not-allowed"
             >
@@ -2054,7 +2335,14 @@ export default function MainAccountPage() {
                         {entry.status === 'pending' && entry.row_source === 'outlet_request' ? (
                           <button
                             type="button"
-                            onClick={() => handleAcceptMainFundRequest(entry.id)}
+                            onClick={() =>
+                              openConfirmModal(
+                                'Confirm Pending Transfer Acceptance',
+                                'Do you want to accept this pending outlet transfer and post it to the main account?',
+                                () => handleAcceptMainFundRequest(entry.id),
+                                'Accept Transfer'
+                              )
+                            }
                             disabled={acceptingRequestId === entry.id}
                             className="ml-2 rounded-full bg-emerald-100 px-3 py-1 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:opacity-50"
                           >
@@ -2111,6 +2399,70 @@ export default function MainAccountPage() {
           </div>
         </section>
       </main>
+
+      {modalAlert.isOpen ? (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/45 px-4">
+          <div className="w-full max-w-md rounded-2xl border border-white/50 bg-white p-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-base font-semibold text-black">{modalAlert.title}</h3>
+                <p className="mt-1 text-sm text-black">{modalAlert.message}</p>
+              </div>
+              <span
+                className={`mt-0.5 inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                  modalAlert.tone === 'success'
+                    ? 'bg-emerald-100 text-emerald-700'
+                    : modalAlert.tone === 'error'
+                      ? 'bg-rose-100 text-rose-700'
+                      : modalAlert.tone === 'warning'
+                        ? 'bg-amber-100 text-amber-700'
+                        : 'bg-cyan-100 text-cyan-700'
+                }`}
+              >
+                {modalAlert.tone}
+              </span>
+            </div>
+
+            <div className="mt-5 flex justify-end">
+              <button
+                type="button"
+                onClick={closeAlertModal}
+                className="rounded-full bg-gradient-to-r from-emerald-600 to-teal-600 px-4 py-2 text-sm font-semibold text-white hover:from-emerald-700 hover:to-teal-700"
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {modalConfirm.isOpen ? (
+        <div className="fixed inset-0 z-[130] flex items-center justify-center bg-black/50 px-4">
+          <div className="w-full max-w-md rounded-2xl border border-white/50 bg-white p-5 shadow-2xl">
+            <h3 className="text-base font-semibold text-black">{modalConfirm.title}</h3>
+            <p className="mt-1 text-sm text-black">{modalConfirm.message}</p>
+
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={closeConfirmModal}
+                disabled={modalConfirm.busy}
+                className="rounded-full border border-gray-300 bg-white px-4 py-2 text-sm font-semibold text-black hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {modalConfirm.cancelText}
+              </button>
+              <button
+                type="button"
+                onClick={() => void runConfirmAction()}
+                disabled={modalConfirm.busy}
+                className="rounded-full bg-gradient-to-r from-emerald-600 to-teal-600 px-4 py-2 text-sm font-semibold text-white hover:from-emerald-700 hover:to-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {modalConfirm.busy ? 'Processing...' : modalConfirm.confirmText}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

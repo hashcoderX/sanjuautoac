@@ -92,15 +92,9 @@ export default function AttendanceReportPage() {
 
         const hasReportPermission = permissionNames.some((permission: string) => permission.includes('report'));
 
-        if (!isAdminUser && !hasReportPermission) {
-          router.push('/dashboard');
-          return;
-        }
-
         await fetchAttendance(storedToken);
       } catch (error) {
         console.error('Error checking attendance report access:', error);
-        router.push('/dashboard');
       } finally {
         setAccessReady(true);
       }

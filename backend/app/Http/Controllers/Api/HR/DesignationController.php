@@ -45,10 +45,19 @@ class DesignationController extends Controller
             'is_active' => 'boolean',
         ]);
 
+        $tenantId = (int) $request->input('tenant_id', $request->user()?->employee?->tenant_id ?? $request->user()?->branch_id ?? 0);
+        $branchId = (int) $request->input('branch_id', $request->user()?->employee?->branch_id ?? $request->user()?->branch_id ?? 0);
+
+        if ($tenantId <= 0 || $branchId <= 0) {
+            return response()->json([
+                'message' => 'Unable to resolve tenant and branch for designation creation.',
+            ], 422);
+        }
+
         // Set default values for required fields
         $designationData = [
-            'tenant_id' => 1, // Default tenant
-            'branch_id' => 1, // Default branch
+            'tenant_id' => $tenantId,
+            'branch_id' => $branchId,
             'name' => $validated['name'],
             'description' => $validated['description'] ?? null,
             'salary_range_min' => $validated['salary_range_min'] ?? null,

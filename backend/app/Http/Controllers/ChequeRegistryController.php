@@ -18,14 +18,66 @@ use Illuminate\Support\Facades\Validator;
 
 class ChequeRegistryController extends Controller
 {
+    private function isPrivilegedAdmin(?\App\Models\User $user): bool
+    {
+        if (!$user) {
+            return false;
+        }
+
+        $user->loadMissing('roles');
+
+        $roleNames = $user->roles
+            ->pluck('name')
+            ->push((string) ($user->role ?? ''))
+            ->map(fn ($name) => strtolower(trim((string) $name)))
+            ->filter();
+
+        return $roleNames->contains(function ($roleName) {
+            return str_contains($roleName, 'super admin')
+                || str_contains($roleName, 'superadmin')
+                || str_contains($roleName, 'administrator');
+        });
+    }
+
+    private function tenantContext(Request $request): array
+    {
+        $user = $request->user();
+        $tenantId = (int) ($request->input('tenant_id') ?? $request->attributes->get('tenant_id') ?? $user?->employee?->tenant_id ?? $user?->branch_id ?? 0);
+        $branchId = (int) ($request->input('branch_id') ?? $request->attributes->get('branch_id') ?? $user?->employee?->branch_id ?? $user?->branch_id ?? 0);
+
+        return [$tenantId, $branchId, $this->isPrivilegedAdmin($user)];
+    }
+
+    private function ensureEntryTenantAccess(ChequeRegistryEntry $entry, int $tenantId, bool $isPrivilegedAdmin): ?JsonResponse
+    {
+        if ($isPrivilegedAdmin) {
+            return null;
+        }
+
+        if ($tenantId <= 0 || (int) ($entry->company_id ?? 0) !== $tenantId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized cheque registry access.',
+            ], 403);
+        }
+
+        return null;
+    }
+
     public function index(Request $request): JsonResponse
     {
+        [$tenantId, $branchId, $isPrivilegedAdmin] = $this->tenantContext($request);
+
         $query = ChequeRegistryEntry::with([
             'company:id,name',
             'chequeAccount:id,company_id,bank_name,account_no,current_balance',
             'distributionPayment:id,payment_number,payment_date,amount,payment_method,reference_no,status,received_by,customer_id',
             'distributionPayment.customer:id,shop_name,customer_code',
         ])->orderByDesc('created_at');
+
+        if (!$isPrivilegedAdmin) {
+            $query->where('company_id', $tenantId);
+        }
 
         if ($request->filled('direction')) {
             $query->where('direction', $request->input('direction'));
@@ -67,6 +119,35 @@ class ChequeRegistryController extends Controller
             ])
             ->get();
 
+        if (!$isPrivilegedAdmin) {
+            $distributionCheques = DB::table('distribution_payments as dp')
+                ->leftJoin('distribution_customers as dc', 'dc.id', '=', 'dp.customer_id')
+                ->leftJoin('users as u', 'u.id', '=', 'dp.received_by')
+                ->leftJoin('loads as l', 'l.id', '=', 'dp.load_id')
+                ->where('dp.payment_method', 'check')
+                ->where('u.branch_id', $branchId)
+                ->orderByDesc('dp.payment_date')
+                ->orderByDesc('dp.id')
+                ->select([
+                    'dp.id',
+                    'dp.payment_number',
+                    'dp.payment_date',
+                    'dp.cheque_date',
+                    'dp.reference_no as cheque_no',
+                    'dp.amount',
+                    'dp.reference_no',
+                    'dp.bank_name',
+                    'dp.status',
+                    'dp.notes',
+                    'dp.created_at',
+                    'l.load_number',
+                    DB::raw("COALESCE(dc.shop_name, '-') as customer_name"),
+                    DB::raw("COALESCE(dc.customer_code, '-') as customer_code"),
+                    DB::raw("COALESCE(u.name, 'Unknown') as sales_person_name"),
+                ])
+                ->get();
+        }
+
         return response()->json([
             'success' => true,
             'data' => $entries,
@@ -77,6 +158,8 @@ class ChequeRegistryController extends Controller
 
     public function registerReceived(Request $request): JsonResponse
     {
+        [$tenantId, $branchId, $isPrivilegedAdmin] = $this->tenantContext($request);
+
         $validator = Validator::make($request->all(), [
             'company_id' => 'required|exists:companies,id',
             'cheque_no' => 'required|string|max:100',
@@ -100,6 +183,13 @@ class ChequeRegistryController extends Controller
         }
 
         $payload = $validator->validated();
+
+        if (!$isPrivilegedAdmin && (int) $payload['company_id'] !== $tenantId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized company for cheque registration.',
+            ], 403);
+        }
 
         if (($payload['source_module'] ?? 'manual') === 'distribution' && empty($payload['distribution_payment_id'])) {
             return response()->json([
@@ -134,7 +224,12 @@ class ChequeRegistryController extends Controller
 
     public function deposit(Request $request, int $id): JsonResponse
     {
+        [$tenantId, $branchId, $isPrivilegedAdmin] = $this->tenantContext($request);
         $entry = ChequeRegistryEntry::find($id);
+        if ($response = $this->ensureEntryTenantAccess($entry, $tenantId, $isPrivilegedAdmin)) {
+            return $response;
+        }
+
 
         if (!$entry) {
             return response()->json([
@@ -173,8 +268,12 @@ class ChequeRegistryController extends Controller
 
         $payload = $validator->validated();
 
-        $updated = DB::transaction(function () use ($entry, $payload, $request) {
-            $bankAccount = CompanyBankAccount::findOrFail($payload['company_bank_account_id']);
+        $updated = DB::transaction(function () use ($entry, $payload, $request, $tenantId, $branchId, $isPrivilegedAdmin) {
+            $bankAccountQuery = CompanyBankAccount::query();
+            if (!$isPrivilegedAdmin) {
+                $bankAccountQuery->where('company_id', $tenantId);
+            }
+            $bankAccount = $bankAccountQuery->findOrFail($payload['company_bank_account_id']);
 
             if ($entry->company_id && (int) $entry->company_id !== (int) $bankAccount->company_id) {
                 throw new HttpResponseException(response()->json([
@@ -208,6 +307,8 @@ class ChequeRegistryController extends Controller
             }
 
             MainCashTransaction::create([
+                'tenant_id' => !$isPrivilegedAdmin ? $tenantId : (int) ($entry->company_id ?? $bankAccount->company_id),
+                'branch_id' => $branchId,
                 'date' => $payload['deposit_date'],
                 'type' => 'in',
                 'amount' => $entry->amount,
@@ -228,7 +329,12 @@ class ChequeRegistryController extends Controller
 
     public function returnCheque(Request $request, int $id): JsonResponse
     {
+        [$tenantId, $branchId, $isPrivilegedAdmin] = $this->tenantContext($request);
         $entry = ChequeRegistryEntry::find($id);
+        if ($response = $this->ensureEntryTenantAccess($entry, $tenantId, $isPrivilegedAdmin)) {
+            return $response;
+        }
+
 
         if (!$entry) {
             return response()->json([
@@ -265,7 +371,7 @@ class ChequeRegistryController extends Controller
 
         $payload = $validator->validated();
 
-        $updated = DB::transaction(function () use ($entry, $payload, $request) {
+        $updated = DB::transaction(function () use ($entry, $payload, $request, $tenantId, $branchId, $isPrivilegedAdmin) {
             $amount = (float) $entry->amount;
             $wasDeposited = in_array($entry->lifecycle_status, ['deposited', 'cleared'], true);
 
@@ -341,6 +447,8 @@ class ChequeRegistryController extends Controller
             ]);
 
             MainCashTransaction::create([
+                'tenant_id' => !$isPrivilegedAdmin ? $tenantId : (int) ($entry->company_id ?? 0),
+                'branch_id' => $branchId,
                 'date' => now()->toDateString(),
                 'type' => 'out',
                 'amount' => $entry->amount,
@@ -361,7 +469,12 @@ class ChequeRegistryController extends Controller
 
     public function endClearance(Request $request, int $id): JsonResponse
     {
+        [$tenantId, $branchId, $isPrivilegedAdmin] = $this->tenantContext($request);
         $entry = ChequeRegistryEntry::find($id);
+        if ($response = $this->ensureEntryTenantAccess($entry, $tenantId, $isPrivilegedAdmin)) {
+            return $response;
+        }
+
 
         if (!$entry) {
             return response()->json([
@@ -398,7 +511,7 @@ class ChequeRegistryController extends Controller
 
         $payload = $validator->validated();
 
-        $updated = DB::transaction(function () use ($entry, $payload, $request) {
+        $updated = DB::transaction(function () use ($entry, $payload, $request, $tenantId, $branchId, $isPrivilegedAdmin) {
             $amount = (float) $entry->amount;
             $companyId = (int) ($entry->company_id ?? 0);
 
@@ -507,6 +620,8 @@ class ChequeRegistryController extends Controller
             ]);
 
             MainCashTransaction::create([
+                'tenant_id' => !$isPrivilegedAdmin ? $tenantId : (int) ($entry->company_id ?? 0),
+                'branch_id' => $branchId,
                 'date' => now()->toDateString(),
                 'type' => 'in',
                 'amount' => $entry->amount,
@@ -527,6 +642,8 @@ class ChequeRegistryController extends Controller
 
     public function issueCheque(Request $request): JsonResponse
     {
+        [$tenantId, $branchId, $isPrivilegedAdmin] = $this->tenantContext($request);
+
         $validator = Validator::make($request->all(), [
             'company_id' => 'required|exists:companies,id',
             'company_cheque_account_id' => 'required|exists:company_cheque_accounts,id',
@@ -550,8 +667,19 @@ class ChequeRegistryController extends Controller
 
         $payload = $validator->validated();
 
-        $entry = DB::transaction(function () use ($payload, $request) {
-            $chequeAccount = CompanyChequeAccount::findOrFail($payload['company_cheque_account_id']);
+        if (!$isPrivilegedAdmin && (int) $payload['company_id'] !== $tenantId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unauthorized company for cheque issue.',
+            ], 403);
+        }
+
+        $entry = DB::transaction(function () use ($payload, $request, $tenantId, $branchId, $isPrivilegedAdmin) {
+            $chequeAccountQuery = CompanyChequeAccount::query();
+            if (!$isPrivilegedAdmin) {
+                $chequeAccountQuery->where('company_id', $tenantId);
+            }
+            $chequeAccount = $chequeAccountQuery->findOrFail($payload['company_cheque_account_id']);
 
             if ((int) $chequeAccount->company_id !== (int) $payload['company_id']) {
                 throw new HttpResponseException(response()->json([

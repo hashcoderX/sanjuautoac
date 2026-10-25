@@ -4,6 +4,8 @@ import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import axios from 'axios';
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
 type BackupSettings = {
   auto_backup_enabled: boolean;
   backup_frequency: 'daily' | 'weekly' | 'monthly';
@@ -26,12 +28,84 @@ export default function BackupRestoreSettingsPage() {
   const [token, setToken] = useState('');
   const [accessReady, setAccessReady] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [settings, setSettings] = useState<BackupSettings>(defaultSettings);
 
   const router = useRouter();
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
+
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchVisibilityProfile = async (authToken: string, userData: any) => {
+    try {
+      const visibilityRes = await axios.get(`${API_URL}/api/feature-visibility`, {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      const superAdmin = isSuperAdminUser(userData || {});
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching backup visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleBackupVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating backup widget visibility:', error);
+    }
+  };
 
   useEffect(() => {
     const storedToken = localStorage.getItem('token');
@@ -77,6 +151,7 @@ export default function BackupRestoreSettingsPage() {
           return;
         }
 
+        await fetchVisibilityProfile(token, userData);
         await fetchSettings(token);
       } catch (error) {
         console.error('Error loading backup settings access:', error);
@@ -88,6 +163,30 @@ export default function BackupRestoreSettingsPage() {
 
     bootstrap();
   }, [token, router]);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
 
   const fetchSettings = async (authToken?: string) => {
     const tokenToUse = authToken || token;
@@ -157,8 +256,6 @@ export default function BackupRestoreSettingsPage() {
     );
   }
 
-  if (!isAdmin) return null;
-
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-cyan-50 to-emerald-50 relative overflow-hidden">
       <div className="absolute inset-0 opacity-40 pointer-events-none">
@@ -167,70 +264,125 @@ export default function BackupRestoreSettingsPage() {
         <div className="absolute bottom-0 left-1/3 w-80 h-80 bg-teal-200/50 rounded-full blur-3xl"></div>
       </div>
 
-      <nav className="relative z-10 bg-white/80 backdrop-blur-md shadow-sm border-b border-white/60">
+      {isElementVisible('backup-restore-el-navbar') && (
+        <nav className="relative z-10 bg-white/80 backdrop-blur-md shadow-sm border-b border-white/60">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between py-3">
+          <div className="relative flex items-center justify-between py-3">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleBackupVisibilityToggle('backup-restore-el-navbar', true); }}
+                className="absolute -right-2 -top-2 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+                title="Hide top bar"
+                aria-label="Hide top bar"
+              >
+                x
+              </button>
+            )}
             <div>
               <h1 className="text-lg font-semibold text-gray-900">Backup &amp; Restore</h1>
               <p className="text-xs text-gray-500">Configure policy, resilience, and restore readiness for business continuity.</p>
             </div>
-            <button
-              onClick={() => router.push('/dashboard')}
-              className="px-4 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors"
-            >
-              Back to Dashboard
-            </button>
+            {isElementVisible('backup-restore-el-btn-back') && (
+              <button
+                onClick={() => router.push('/dashboard')}
+                className="px-4 py-2 border border-gray-300 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors"
+              >
+                Back to Dashboard
+              </button>
+            )}
           </div>
         </div>
       </nav>
+      )}
 
       <main className="relative z-10 max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-6">
-        <section className="rounded-2xl border border-white/70 bg-white/80 backdrop-blur-lg shadow-xl p-5 md:p-6">
+        {isElementVisible('backup-restore-sec-hero') && (
+          <section className="relative rounded-2xl border border-white/70 bg-white/80 backdrop-blur-lg shadow-xl p-5 md:p-6">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleBackupVisibilityToggle('backup-restore-sec-hero', true); }}
+              className="absolute right-3 top-3 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+              title="Hide hero section"
+              aria-label="Hide hero section"
+            >
+              x
+            </button>
+          )}
           <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
             <div>
               <h2 className="text-xl md:text-2xl font-bold text-gray-900">Disaster Recovery Command Center</h2>
               <p className="text-sm text-gray-600 mt-1">Fine-tune automated backups and keep recovery posture consistently healthy.</p>
             </div>
             <div className="flex flex-wrap gap-2">
-              <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-cyan-100 text-cyan-700 border border-cyan-200">
-                {backupFrequencyLabel}
-              </span>
-              <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-700 border border-emerald-200">
-                Retention {settings.retention_days} Days
-              </span>
+              {isElementVisible('backup-restore-el-badge-frequency') && (
+                <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-cyan-100 text-cyan-700 border border-cyan-200">
+                  {backupFrequencyLabel}
+                </span>
+              )}
+              {isElementVisible('backup-restore-el-badge-retention') && (
+                <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-700 border border-emerald-200">
+                  Retention {settings.retention_days} Days
+                </span>
+              )}
             </div>
           </div>
 
           <div className="mt-5 grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="rounded-xl border border-cyan-100 bg-gradient-to-br from-cyan-50 to-white p-4">
+            {isElementVisible('backup-restore-el-stat-readiness') && (
+              <div className="rounded-xl border border-cyan-100 bg-gradient-to-br from-cyan-50 to-white p-4">
               <p className="text-xs uppercase tracking-wide text-cyan-700 font-semibold">Readiness Score</p>
               <p className="text-2xl font-bold text-gray-900 mt-1">{readinessPercent}%</p>
               <div className="mt-3 h-2 w-full rounded-full bg-cyan-100 overflow-hidden">
                 <div className="h-full bg-gradient-to-r from-cyan-500 to-emerald-500 transition-all duration-500" style={{ width: `${readinessPercent}%` }}></div>
               </div>
             </div>
-            <div className="rounded-xl border border-emerald-100 bg-gradient-to-br from-emerald-50 to-white p-4">
+            )}
+            {isElementVisible('backup-restore-el-stat-mode') && (
+              <div className="rounded-xl border border-emerald-100 bg-gradient-to-br from-emerald-50 to-white p-4">
               <p className="text-xs uppercase tracking-wide text-emerald-700 font-semibold">Primary Mode</p>
               <p className="text-2xl font-bold text-gray-900 mt-1">{settings.auto_backup_enabled ? 'Automated' : 'Manual'}</p>
               <p className="text-xs text-gray-600 mt-1">{settings.auto_backup_enabled ? 'Backups run by schedule.' : 'Backups require manual operation.'}</p>
             </div>
-            <div className="rounded-xl border border-teal-100 bg-gradient-to-br from-teal-50 to-white p-4">
+            )}
+            {isElementVisible('backup-restore-el-stat-storage-security') && (
+              <div className="rounded-xl border border-teal-100 bg-gradient-to-br from-teal-50 to-white p-4">
               <p className="text-xs uppercase tracking-wide text-teal-700 font-semibold">Storage Security</p>
               <p className="text-2xl font-bold text-gray-900 mt-1">{settings.encryption_enabled ? 'Encrypted' : 'Unencrypted'}</p>
               <p className="text-xs text-gray-600 mt-1">{settings.cloud_sync_enabled ? 'Cloud replication enabled.' : 'Local-only backup storage.'}</p>
             </div>
+            )}
           </div>
         </section>
+        )}
 
-        <section className="rounded-2xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-xl p-5 md:p-6">
-          <h3 className="text-sm font-semibold text-gray-900 mb-2">Backup Policy</h3>
-          <p className="text-sm text-gray-600 mb-4">Set cadence, retention, and protection controls for reliable restore operations.</p>
+        {isElementVisible('backup-restore-sec-policy') && (
+          <section className="relative rounded-2xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-xl p-5 md:p-6">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleBackupVisibilityToggle('backup-restore-sec-policy', true); }}
+              className="absolute right-3 top-3 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+              title="Hide backup policy section"
+              aria-label="Hide backup policy section"
+            >
+              x
+            </button>
+          )}
+          {isElementVisible('backup-restore-el-title-policy') && (
+            <h3 className="text-sm font-semibold text-gray-900 mb-2">Backup Policy</h3>
+          )}
+          {isElementVisible('backup-restore-el-desc-policy') && (
+            <p className="text-sm text-gray-600 mb-4">Set cadence, retention, and protection controls for reliable restore operations.</p>
+          )}
 
           {loading ? (
             <div className="text-sm text-gray-500">Loading backup settings...</div>
           ) : (
             <div className="space-y-4">
-              <div className="flex items-center justify-between rounded-xl border border-gray-200 bg-gradient-to-r from-gray-50 to-white p-4">
+              {isElementVisible('backup-restore-el-control-auto-backup') && (
+                <div className="flex items-center justify-between rounded-xl border border-gray-200 bg-gradient-to-r from-gray-50 to-white p-4">
                 <div>
                   <p className="text-sm font-medium text-gray-900">Automatic Backups</p>
                   <p className="text-xs text-gray-500">Run scheduled backups without manual action.</p>
@@ -243,9 +395,11 @@ export default function BackupRestoreSettingsPage() {
                   {settings.auto_backup_enabled ? 'Enabled' : 'Disabled'}
                 </button>
               </div>
+              )}
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="rounded-xl border border-gray-200 bg-white p-4">
+                {isElementVisible('backup-restore-el-input-frequency') && (
+                  <div className="rounded-xl border border-gray-200 bg-white p-4">
                   <label className="block text-xs font-medium text-gray-700 mb-1">Backup Frequency</label>
                   <select
                     value={settings.backup_frequency}
@@ -257,7 +411,9 @@ export default function BackupRestoreSettingsPage() {
                     <option value="monthly">Monthly</option>
                   </select>
                 </div>
-                <div className="rounded-xl border border-gray-200 bg-white p-4">
+                )}
+                {isElementVisible('backup-restore-el-input-retention') && (
+                  <div className="rounded-xl border border-gray-200 bg-white p-4">
                   <label className="block text-xs font-medium text-gray-700 mb-1">Retention (Days)</label>
                   <input
                     type="number"
@@ -268,9 +424,11 @@ export default function BackupRestoreSettingsPage() {
                     className="w-full rounded-md border border-gray-300 text-sm text-black px-2 py-2 focus:ring-2 focus:ring-cyan-500 focus:border-cyan-500"
                   />
                 </div>
+                )}
               </div>
 
-              <div className="flex items-center justify-between rounded-xl border border-gray-200 bg-gradient-to-r from-gray-50 to-white p-4">
+              {isElementVisible('backup-restore-el-control-include-files') && (
+                <div className="flex items-center justify-between rounded-xl border border-gray-200 bg-gradient-to-r from-gray-50 to-white p-4">
                 <div>
                   <p className="text-sm font-medium text-gray-900">Include Uploaded Files</p>
                   <p className="text-xs text-gray-500">Include documents and media files in each backup.</p>
@@ -283,8 +441,10 @@ export default function BackupRestoreSettingsPage() {
                   {settings.include_uploaded_files ? 'Enabled' : 'Disabled'}
                 </button>
               </div>
+              )}
 
-              <div className="flex items-center justify-between rounded-xl border border-gray-200 bg-gradient-to-r from-gray-50 to-white p-4">
+              {isElementVisible('backup-restore-el-control-encryption') && (
+                <div className="flex items-center justify-between rounded-xl border border-gray-200 bg-gradient-to-r from-gray-50 to-white p-4">
                 <div>
                   <p className="text-sm font-medium text-gray-900">Backup Encryption</p>
                   <p className="text-xs text-gray-500">Encrypt backup artifacts before storage.</p>
@@ -297,8 +457,10 @@ export default function BackupRestoreSettingsPage() {
                   {settings.encryption_enabled ? 'Enabled' : 'Disabled'}
                 </button>
               </div>
+              )}
 
-              <div className="flex items-center justify-between rounded-xl border border-gray-200 bg-gradient-to-r from-gray-50 to-white p-4">
+              {isElementVisible('backup-restore-el-control-cloud-sync') && (
+                <div className="flex items-center justify-between rounded-xl border border-gray-200 bg-gradient-to-r from-gray-50 to-white p-4">
                 <div>
                   <p className="text-sm font-medium text-gray-900">Cloud Sync</p>
                   <p className="text-xs text-gray-500">Replicate backups to cloud storage for disaster recovery.</p>
@@ -311,32 +473,40 @@ export default function BackupRestoreSettingsPage() {
                   {settings.cloud_sync_enabled ? 'Enabled' : 'Disabled'}
                 </button>
               </div>
+              )}
 
-              <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                Restore operations should be performed only during approved maintenance windows.
-              </div>
+              {isElementVisible('backup-restore-el-warning-note') && (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                  Restore operations should be performed only during approved maintenance windows.
+                </div>
+              )}
             </div>
           )}
 
           <div className="mt-5 flex gap-2">
-            <button
-              type="button"
-              onClick={saveSettings}
-              disabled={loading || saving}
-              className="px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 border border-transparent rounded-md text-sm font-semibold text-white hover:from-emerald-700 hover:to-teal-700 shadow-lg shadow-emerald-200/50 disabled:opacity-60 disabled:cursor-not-allowed transition-all"
-            >
-              {saving ? 'Saving...' : 'Save Changes'}
-            </button>
-            <button
-              type="button"
-              onClick={() => fetchSettings()}
-              disabled={loading || saving}
-              className="px-5 py-2.5 bg-white border border-gray-300 rounded-md text-sm font-semibold text-gray-700 hover:bg-gray-50 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
-            >
-              Refresh
-            </button>
+            {isElementVisible('backup-restore-el-btn-save') && (
+              <button
+                type="button"
+                onClick={saveSettings}
+                disabled={loading || saving}
+                className="px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 border border-transparent rounded-md text-sm font-semibold text-white hover:from-emerald-700 hover:to-teal-700 shadow-lg shadow-emerald-200/50 disabled:opacity-60 disabled:cursor-not-allowed transition-all"
+              >
+                {saving ? 'Saving...' : 'Save Changes'}
+              </button>
+            )}
+            {isElementVisible('backup-restore-el-btn-refresh') && (
+              <button
+                type="button"
+                onClick={() => fetchSettings()}
+                disabled={loading || saving}
+                className="px-5 py-2.5 bg-white border border-gray-300 rounded-md text-sm font-semibold text-gray-700 hover:bg-gray-50 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+              >
+                Refresh
+              </button>
+            )}
           </div>
         </section>
+        )}
       </main>
     </div>
   );

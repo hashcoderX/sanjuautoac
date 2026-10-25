@@ -1,8 +1,12 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import axios from 'axios';
+
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+const INVENTORY_MEMORY_CACHE_TTL_MS = 15 * 60 * 1000;
+const SUPPLIERS_MEMORY_CACHE_TTL_MS = 15 * 60 * 1000;
 
 interface InventoryItem {
   id: number;
@@ -53,11 +57,33 @@ type StockStateFilter = 'all' | 'out_of_stock' | 'low_stock' | 'healthy_stock' |
 
 export default function Inventory() {
   const [token, setToken] = useState('');
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [activeTab] = useState<'raw_material' | 'finished_good'>('finished_good');
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [showModal, setShowModal] = useState(false);
+  const [showImportModal, setShowImportModal] = useState(false);
   const [editingItem, setEditingItem] = useState<InventoryItem | null>(null);
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [importSupplierId, setImportSupplierId] = useState('');
+  const [importUseDiscount, setImportUseDiscount] = useState(false);
+  const [importDiscountMode, setImportDiscountMode] = useState<'amount' | 'percent'>('amount');
+  const [importDiscountValue, setImportDiscountValue] = useState('');
+  const [importUseProfit, setImportUseProfit] = useState(false);
+  const [importProfitMode, setImportProfitMode] = useState<'amount' | 'percent'>('amount');
+  const [importProfitValue, setImportProfitValue] = useState('');
+  const [importSummary, setImportSummary] = useState<{
+    created: number;
+    updated: number;
+    skipped: number;
+    failed: number;
+    errors: Array<{ row: number; message: string }>;
+  } | null>(null);
+  const [importProgress, setImportProgress] = useState(0);
+  const [importProgressPhase, setImportProgressPhase] = useState<'idle' | 'uploading' | 'processing'>('idle');
   const [suppliers, setSuppliers] = useState<any[]>([]);
   const [formData, setFormData] = useState({
     name: '',
@@ -86,8 +112,89 @@ export default function Inventory() {
   const [supplierFilter, setSupplierFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'inactive'>('all');
   const [stockStateFilter, setStockStateFilter] = useState<StockStateFilter>('all');
+  const [currentPage, setCurrentPage] = useState(1);
+  const [rowsPerPage, setRowsPerPage] = useState(10);
+  const [isBackgroundLoading, setIsBackgroundLoading] = useState(false);
+  const [loadedItemsCount, setLoadedItemsCount] = useState(0);
+  const [totalItemsCount, setTotalItemsCount] = useState(0);
+  const fetchRunIdRef = useRef(0);
   const router = useRouter();
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
+
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+  const isColumnVisible = (key: string) => !hiddenModules.includes(key);
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchAccessProfile = async (authToken: string) => {
+    try {
+      const [userRes, visibilityRes] = await Promise.all([
+        axios.get(`${API_URL}/api/user`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+      ]);
+
+      const superAdmin = isSuperAdminUser(userRes.data || {});
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching stock inventory visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleInventoryVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating stock inventory widget visibility:', error);
+    }
+  };
 
   const toSafeNumber = (value: unknown): number => {
     const parsed = Number(value);
@@ -112,8 +219,33 @@ export default function Inventory() {
       router.push('/');
     } else {
       setToken(storedToken);
+      fetchAccessProfile(storedToken);
     }
   }, [router]);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
 
   useEffect(() => {
     if (token) {
@@ -122,7 +254,57 @@ export default function Inventory() {
     }
   }, [token, activeTab]);
 
-  const fetchSuppliers = async () => {
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [search, categoryFilter, supplierFilter, statusFilter, stockStateFilter]);
+
+  const readSuppliersMemoryCache = (): any[] | null => {
+    if (!suppliersMemoryCache) return null;
+    const isFresh = Date.now() - suppliersMemoryCache.timestamp < SUPPLIERS_MEMORY_CACHE_TTL_MS;
+    return isFresh ? suppliersMemoryCache.suppliers : null;
+  };
+
+  const writeSuppliersMemoryCache = (supplierList: any[]) => {
+    suppliersMemoryCache = {
+      timestamp: Date.now(),
+      suppliers: supplierList,
+    };
+  };
+
+  const readInventoryMemoryCache = (type: 'raw_material' | 'finished_good'): InventoryMemoryCacheEntry | null => {
+    const cached = inventoryMemoryCache[type];
+    if (!cached) return null;
+    const isFresh = Date.now() - cached.timestamp < INVENTORY_MEMORY_CACHE_TTL_MS;
+    return isFresh ? cached : null;
+  };
+
+  const writeInventoryMemoryCache = (
+    type: 'raw_material' | 'finished_good',
+    payload: {
+      items: InventoryItem[];
+      loadedItemsCount: number;
+      totalItemsCount: number;
+      isBackgroundLoading: boolean;
+    }
+  ) => {
+    inventoryMemoryCache[type] = {
+      timestamp: Date.now(),
+      items: payload.items,
+      loadedItemsCount: payload.loadedItemsCount,
+      totalItemsCount: payload.totalItemsCount,
+      isBackgroundLoading: payload.isBackgroundLoading,
+    };
+  };
+
+  const fetchSuppliers = async (forceRefresh = false) => {
+    if (!forceRefresh) {
+      const cachedSuppliers = readSuppliersMemoryCache();
+      if (cachedSuppliers) {
+        setSuppliers(cachedSuppliers);
+        return;
+      }
+    }
+
     try {
       const response = await axios.get(`${API_URL}/api/stock/suppliers`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -130,35 +312,166 @@ export default function Inventory() {
       });
 
       if (response.data.success) {
-        setSuppliers(response.data.data.data || []);
+        const supplierList = response.data.data.data || [];
+        setSuppliers(supplierList);
+        writeSuppliersMemoryCache(supplierList);
       }
     } catch (error) {
       console.error('Error fetching suppliers:', error);
     }
   };
 
-  const fetchItems = async () => {
+  const fetchItems = async (forceRefresh = false) => {
+    const runId = ++fetchRunIdRef.current;
+
+    const formatItems = (source: any[]) =>
+      source.map((item: any) => ({
+        ...item,
+        current_stock: toSafeNumber(item.current_stock),
+        minimum_stock: toSafeNumber(item.minimum_stock),
+        maximum_stock: toSafeNumber(item.maximum_stock),
+        purchase_price: toSafeNumber(item.purchase_price),
+        sell_price: toSafeNumber(item.sell_price),
+        unit_price: resolveItemPrice(item),
+      }));
+
+    const mergeById = (base: InventoryItem[], incoming: InventoryItem[]) => {
+      const merged = new Map<number, InventoryItem>();
+      base.forEach((item) => merged.set(item.id, item));
+      incoming.forEach((item) => merged.set(item.id, item));
+      return Array.from(merged.values());
+    };
+
+    if (!forceRefresh) {
+      const cachedItems = readInventoryMemoryCache(activeTab);
+      if (cachedItems) {
+        setItems(cachedItems.items);
+        setLoadedItemsCount(cachedItems.loadedItemsCount);
+        setTotalItemsCount(cachedItems.totalItemsCount);
+        setIsBackgroundLoading(cachedItems.isBackgroundLoading);
+        setLoading(false);
+        return;
+      }
+    }
+
     try {
       setLoading(true);
-      const response = await axios.get(`${API_URL}/api/stock/inventory`, {
+      setIsBackgroundLoading(false);
+      setLoadedItemsCount(0);
+      setTotalItemsCount(0);
+
+      const initialPageSize = 100;
+      const initialResponse = await axios.get(`${API_URL}/api/stock/inventory`, {
         headers: { Authorization: `Bearer ${token}` },
-        params: { type: activeTab, per_page: 100 }
+        params: { type: activeTab, per_page: initialPageSize, page: 1 }
       });
 
-      if (response.data.success) {
-        const itemsData = response.data.data.data || [];
-        const formattedItems = itemsData.map((item: any) => ({
-          ...item,
-          current_stock: toSafeNumber(item.current_stock),
-          minimum_stock: toSafeNumber(item.minimum_stock),
-          maximum_stock: toSafeNumber(item.maximum_stock),
-          purchase_price: toSafeNumber(item.purchase_price),
-          sell_price: toSafeNumber(item.sell_price),
-          unit_price: resolveItemPrice(item),
-        }));
-        setItems(formattedItems);
+      if (runId !== fetchRunIdRef.current) {
+        return;
+      }
+
+      if (initialResponse.data?.success) {
+        const pagePayload = initialResponse.data?.data;
+        const firstPageItems = Array.isArray(pagePayload?.data)
+          ? pagePayload.data
+          : Array.isArray(pagePayload)
+            ? pagePayload
+            : [];
+
+        const formattedFirstPage = formatItems(firstPageItems);
+        setItems(formattedFirstPage);
+
+        const resolvedTotalItems = Number(pagePayload?.total || formattedFirstPage.length || 0);
+        const safeTotalItems = Number.isFinite(resolvedTotalItems) ? Math.max(0, resolvedTotalItems) : formattedFirstPage.length;
+        setLoadedItemsCount(formattedFirstPage.length);
+        setTotalItemsCount(safeTotalItems);
+
+        const payloadLastPage = Number(pagePayload?.last_page || 1);
+        const lastPage = Number.isFinite(payloadLastPage) && payloadLastPage > 0
+          ? payloadLastPage
+          : Math.max(1, Math.ceil(safeTotalItems / initialPageSize));
+
+        writeInventoryMemoryCache(activeTab, {
+          items: formattedFirstPage,
+          loadedItemsCount: formattedFirstPage.length,
+          totalItemsCount: safeTotalItems,
+          isBackgroundLoading: lastPage > 1,
+        });
+
+        // Show first 100 quickly, then continue loading in background.
+        if (lastPage > 1) {
+          setIsBackgroundLoading(true);
+          setLoading(false);
+
+          let loadedSoFar = formattedFirstPage.length;
+          let mergedItems = formattedFirstPage;
+
+          for (let page = 2; page <= lastPage; page++) {
+            if (runId !== fetchRunIdRef.current) {
+              return;
+            }
+
+            try {
+              const pageResponse = await axios.get(`${API_URL}/api/stock/inventory`, {
+                headers: { Authorization: `Bearer ${token}` },
+                params: { type: activeTab, per_page: initialPageSize, page }
+              });
+
+              if (!pageResponse.data?.success) {
+                continue;
+              }
+
+              const nextPayload = pageResponse.data?.data;
+              const nextRows = Array.isArray(nextPayload?.data)
+                ? nextPayload.data
+                : Array.isArray(nextPayload)
+                  ? nextPayload
+                  : [];
+              const formattedNextRows = formatItems(nextRows);
+
+              mergedItems = mergeById(mergedItems, formattedNextRows);
+              setItems(mergedItems);
+              loadedSoFar += formattedNextRows.length;
+              setLoadedItemsCount(loadedSoFar);
+
+              writeInventoryMemoryCache(activeTab, {
+                items: mergedItems,
+                loadedItemsCount: loadedSoFar,
+                totalItemsCount: safeTotalItems,
+                isBackgroundLoading: true,
+              });
+            } catch (backgroundError) {
+              console.error(`Background inventory load failed on page ${page}:`, backgroundError);
+            }
+          }
+
+          if (runId === fetchRunIdRef.current) {
+            setIsBackgroundLoading(false);
+            writeInventoryMemoryCache(activeTab, {
+              items: mergedItems,
+              loadedItemsCount: mergedItems.length,
+              totalItemsCount: safeTotalItems,
+              isBackgroundLoading: false,
+            });
+          }
+
+          return;
+        }
+
+        writeInventoryMemoryCache(activeTab, {
+          items: formattedFirstPage,
+          loadedItemsCount: formattedFirstPage.length,
+          totalItemsCount: safeTotalItems,
+          isBackgroundLoading: false,
+        });
       } else {
         setItems([]);
+        writeInventoryMemoryCache(activeTab, {
+          items: [],
+          loadedItemsCount: 0,
+          totalItemsCount: 0,
+          isBackgroundLoading: false,
+        });
       }
     } catch (error) {
       console.error('Error fetching inventory items:', error);
@@ -228,7 +541,9 @@ export default function Inventory() {
       ];
       setItems(mockItems);
     } finally {
-      setLoading(false);
+      if (runId === fetchRunIdRef.current) {
+        setLoading(false);
+      }
     }
   };
 
@@ -250,19 +565,30 @@ export default function Inventory() {
         });
 
         if (response.data.success) {
-          setItems(prev => prev.map(item =>
-            item.id === editingItem.id
-              ? {
-                  ...response.data.data,
-                  current_stock: toSafeNumber(response.data.data.current_stock),
-                  minimum_stock: toSafeNumber(response.data.data.minimum_stock),
-                  maximum_stock: toSafeNumber(response.data.data.maximum_stock),
-                  purchase_price: toSafeNumber(response.data.data.purchase_price),
-                  sell_price: toSafeNumber(response.data.data.sell_price),
-                  unit_price: resolveItemPrice(response.data.data),
-                }
-              : item
-          ));
+          setItems(prev => {
+            const nextItems = prev.map(item =>
+              item.id === editingItem.id
+                ? {
+                    ...response.data.data,
+                    current_stock: toSafeNumber(response.data.data.current_stock),
+                    minimum_stock: toSafeNumber(response.data.data.minimum_stock),
+                    maximum_stock: toSafeNumber(response.data.data.maximum_stock),
+                    purchase_price: toSafeNumber(response.data.data.purchase_price),
+                    sell_price: toSafeNumber(response.data.data.sell_price),
+                    unit_price: resolveItemPrice(response.data.data),
+                  }
+                : item
+            );
+
+            writeInventoryMemoryCache(activeTab, {
+              items: nextItems,
+              loadedItemsCount: nextItems.length,
+              totalItemsCount: Math.max(totalItemsCount, nextItems.length),
+              isBackgroundLoading: false,
+            });
+
+            return nextItems;
+          });
         } else {
           throw new Error(response.data.message || 'Failed to update item');
         }
@@ -272,18 +598,29 @@ export default function Inventory() {
         });
 
         if (response.data.success) {
-          setItems(prev => [
-            ...prev,
-            {
-              ...response.data.data,
-              current_stock: toSafeNumber(response.data.data.current_stock),
-              minimum_stock: toSafeNumber(response.data.data.minimum_stock),
-              maximum_stock: toSafeNumber(response.data.data.maximum_stock),
-              purchase_price: toSafeNumber(response.data.data.purchase_price),
-              sell_price: toSafeNumber(response.data.data.sell_price),
-              unit_price: resolveItemPrice(response.data.data),
-            },
-          ]);
+          setItems(prev => {
+            const nextItems = [
+              ...prev,
+              {
+                ...response.data.data,
+                current_stock: toSafeNumber(response.data.data.current_stock),
+                minimum_stock: toSafeNumber(response.data.data.minimum_stock),
+                maximum_stock: toSafeNumber(response.data.data.maximum_stock),
+                purchase_price: toSafeNumber(response.data.data.purchase_price),
+                sell_price: toSafeNumber(response.data.data.sell_price),
+                unit_price: resolveItemPrice(response.data.data),
+              },
+            ];
+
+            writeInventoryMemoryCache(activeTab, {
+              items: nextItems,
+              loadedItemsCount: nextItems.length,
+              totalItemsCount: Math.max(totalItemsCount, nextItems.length),
+              isBackgroundLoading: false,
+            });
+
+            return nextItems;
+          });
         } else {
           throw new Error(response.data.message || 'Failed to create item');
         }
@@ -334,7 +671,16 @@ export default function Inventory() {
       });
 
       if (response.data.success) {
-        setItems(prev => prev.filter(item => item.id !== id));
+        setItems(prev => {
+          const nextItems = prev.filter(item => item.id !== id);
+          writeInventoryMemoryCache(activeTab, {
+            items: nextItems,
+            loadedItemsCount: nextItems.length,
+            totalItemsCount: Math.min(totalItemsCount, nextItems.length),
+            isBackgroundLoading: false,
+          });
+          return nextItems;
+        });
         setDeleteConfirm(null);
       } else {
         throw new Error(response.data.message || 'Failed to delete item');
@@ -371,6 +717,91 @@ export default function Inventory() {
     setSkuManuallyEdited(false);
     resetForm();
     setShowModal(true);
+  };
+
+  const openImportModal = () => {
+    setImportFile(null);
+    setImportSupplierId('');
+    setImportUseDiscount(false);
+    setImportDiscountMode('amount');
+    setImportDiscountValue('');
+    setImportUseProfit(false);
+    setImportProfitMode('amount');
+    setImportProfitValue('');
+    setImportSummary(null);
+    setImportProgress(0);
+    setImportProgressPhase('idle');
+    setShowImportModal(true);
+  };
+
+  const handleImportCsv = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!importFile) {
+      alert('Please choose a CSV file first.');
+      return;
+    }
+
+    const form = new FormData();
+    form.append('file', importFile);
+    form.append('default_type', activeTab);
+    if (importSupplierId) {
+      form.append('supplier_id', importSupplierId);
+    }
+    form.append('use_discount', importUseDiscount ? '1' : '0');
+    form.append('discount_mode', importUseDiscount ? importDiscountMode : 'none');
+    if (importUseDiscount) {
+      form.append('discount_value', String(Number(importDiscountValue) || 0));
+    }
+    form.append('use_profit', importUseProfit ? '1' : '0');
+    form.append('profit_mode', importUseProfit ? importProfitMode : 'none');
+    if (importUseProfit) {
+      form.append('profit_value', String(Number(importProfitValue) || 0));
+    }
+
+    try {
+      setImporting(true);
+      setImportProgress(0);
+      setImportProgressPhase('uploading');
+      const response = await axios.post(`${API_URL}/api/stock/inventory/import-csv`, form, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'multipart/form-data',
+        },
+        onUploadProgress: (progressEvent) => {
+          if (!progressEvent.total || progressEvent.total <= 0) {
+            setImportProgress((prev) => Math.min(prev + 3, 90));
+            return;
+          }
+
+          const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+          setImportProgress(Math.min(percent, 95));
+          if (percent >= 100) {
+            setImportProgressPhase('processing');
+          }
+        },
+      });
+
+      setImportProgress(100);
+      setImportProgressPhase('idle');
+
+      const summary = response.data?.data || {};
+      setImportSummary({
+        created: Number(summary.created) || 0,
+        updated: Number(summary.updated) || 0,
+        skipped: Number(summary.skipped) || 0,
+        failed: Number(summary.failed) || 0,
+        errors: Array.isArray(summary.errors) ? summary.errors : [],
+      });
+
+      await fetchItems(true);
+      await fetchSuppliers(true);
+    } catch (error: any) {
+      console.error('Error importing CSV:', error);
+      setImportProgressPhase('idle');
+      alert(error.response?.data?.message || error.message || 'Failed to import CSV file');
+    } finally {
+      setImporting(false);
+    }
   };
 
   const generateSkuCode = (name: string, type: 'raw_material' | 'finished_good') => {
@@ -503,7 +934,40 @@ export default function Inventory() {
     setSupplierFilter('all');
     setStatusFilter('all');
     setStockStateFilter('all');
+    setCurrentPage(1);
   };
+
+  const totalPages = Math.max(1, Math.ceil(filteredItems.length / rowsPerPage));
+
+  useEffect(() => {
+    if (currentPage > totalPages) {
+      setCurrentPage(totalPages);
+    }
+  }, [currentPage, totalPages]);
+
+  const paginatedItems = useMemo(() => {
+    const startIndex = (currentPage - 1) * rowsPerPage;
+    return filteredItems.slice(startIndex, startIndex + rowsPerPage);
+  }, [filteredItems, currentPage, rowsPerPage]);
+
+  const paginationPages = useMemo(() => {
+    if (totalPages <= 7) {
+      return Array.from({ length: totalPages }, (_, idx) => idx + 1);
+    }
+
+    if (currentPage <= 4) {
+      return [1, 2, 3, 4, 5, -1, totalPages];
+    }
+
+    if (currentPage >= totalPages - 3) {
+      return [1, -1, totalPages - 4, totalPages - 3, totalPages - 2, totalPages - 1, totalPages];
+    }
+
+    return [1, -1, currentPage - 1, currentPage, currentPage + 1, -1, totalPages];
+  }, [currentPage, totalPages]);
+
+  const pageStart = filteredItems.length === 0 ? 0 : (currentPage - 1) * rowsPerPage + 1;
+  const pageEnd = Math.min(currentPage * rowsPerPage, filteredItems.length);
 
   const modalLabelClass = 'block text-xs font-semibold uppercase tracking-wide text-gray-600';
   const modalInputClass = 'mt-1.5 block w-full rounded-xl border border-orange-100 bg-gradient-to-b from-white to-orange-50/30 px-3.5 py-2.5 text-sm text-gray-900 shadow-sm transition-all duration-200 placeholder:text-gray-400 focus:border-orange-400 focus:ring-4 focus:ring-orange-100 focus:outline-none';
@@ -512,6 +976,17 @@ export default function Inventory() {
   const totalStockValue = filteredItems.reduce((sum, item) => sum + (item.current_stock * resolveItemPrice(item)), 0);
   const lowStockItems = filteredItems.filter((item) => getStockStateKey(item) === 'low_stock').length;
   const inStockItems = filteredItems.filter((item) => getStockStateKey(item) === 'healthy_stock').length;
+  const visibleInventoryColumns = Math.max(
+    [
+      'stock-inventory-col-item',
+      'stock-inventory-col-stock-info',
+      'stock-inventory-col-batch',
+      'stock-inventory-col-price',
+      'stock-inventory-col-status',
+      'stock-inventory-col-actions',
+    ].filter((key) => isColumnVisible(key)).length,
+    1
+  );
   const filterInputClass =
     'mt-1.5 block w-full rounded-xl border border-orange-100 bg-gradient-to-b from-white to-orange-50/30 px-3.5 py-2.5 text-sm text-gray-900 shadow-sm transition-all duration-200 placeholder:text-gray-400 focus:border-orange-400 focus:ring-4 focus:ring-orange-100 focus:outline-none';
 
@@ -526,7 +1001,19 @@ export default function Inventory() {
   return (
     <div className="min-h-screen space-y-6 bg-[radial-gradient(circle_at_top_left,_rgba(251,146,60,0.16),_transparent_23%),radial-gradient(circle_at_top_right,_rgba(245,158,11,0.14),_transparent_25%),linear-gradient(180deg,_#fffaf5_0%,_#fff7ed_42%,_#fff3e4_100%)] p-4 sm:p-6 lg:p-8">
       {/* Header */}
-      <div className="overflow-hidden rounded-[30px] border border-white/70 bg-white/75 shadow-[0_26px_90px_-45px_rgba(194,65,12,0.5)] backdrop-blur-xl">
+      {isElementVisible('stock-inventory-el-header') && (
+        <div className="relative overflow-hidden rounded-[30px] border border-white/70 bg-white/75 shadow-[0_26px_90px_-45px_rgba(194,65,12,0.5)] backdrop-blur-xl">
+        {showWidgetCloseButtons && (
+          <button
+            type="button"
+            onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-el-header', true); }}
+            className="absolute right-3 top-3 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+            title="Hide inventory header"
+            aria-label="Hide inventory header"
+          >
+            x
+          </button>
+        )}
         <div className="grid gap-8 px-5 py-6 sm:px-6 lg:grid-cols-[1.3fr_1fr] lg:px-8">
           <div className="space-y-4">
             <div className="inline-flex items-center gap-2 rounded-full border border-orange-200 bg-orange-50 px-4 py-1.5 text-sm font-semibold text-orange-700">
@@ -541,36 +1028,101 @@ export default function Inventory() {
                 Manage finished goods with richer visibility, cleaner records, and faster item-level decisions.
               </p>
             </div>
-            <button
-              onClick={openAddModal}
-              className="inline-flex items-center rounded-full bg-gradient-to-r from-orange-500 via-amber-500 to-yellow-500 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-orange-300/50 transition hover:scale-[1.02] hover:from-orange-600 hover:to-yellow-500"
-            >
-              <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-              </svg>
-              Add Item
-            </button>
+            {isElementVisible('stock-inventory-el-btn-add') && (
+              <div className="relative inline-flex items-center gap-3">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-el-btn-add', true); }}
+                    className="absolute -right-2 -top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                    title="Hide add button"
+                    aria-label="Hide add button"
+                  >
+                    x
+                  </button>
+                )}
+                <button
+                  onClick={openAddModal}
+                  className="inline-flex items-center rounded-full bg-gradient-to-r from-orange-500 via-amber-500 to-yellow-500 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-orange-300/50 transition hover:scale-[1.02] hover:from-orange-600 hover:to-yellow-500"
+                >
+                  <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                  </svg>
+                  Add Item
+                </button>
+                <button
+                  type="button"
+                  onClick={openImportModal}
+                  className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-5 py-2.5 text-sm font-semibold text-emerald-700 shadow-sm transition hover:bg-emerald-100"
+                >
+                  <svg className="mr-2 h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1M16 8l-4-4m0 0L8 8m4-4v12" />
+                  </svg>
+                  Upload CSV
+                </button>
+              </div>
+            )}
           </div>
 
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1">
-            <div className="rounded-3xl border border-orange-200/70 bg-gradient-to-br from-orange-500 to-amber-500 p-5 text-white shadow-lg shadow-orange-300/45">
+            {isElementVisible('stock-inventory-el-header-stat-total-items') && (
+              <div className="relative rounded-3xl border border-orange-200/70 bg-gradient-to-br from-orange-500 to-amber-500 p-5 text-white shadow-lg shadow-orange-300/45">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-el-header-stat-total-items', true); }}
+                  className="absolute right-2 top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-white/40 bg-white/20 text-xs font-bold text-white hover:bg-white/30"
+                  title="Hide total items stat"
+                  aria-label="Hide total items stat"
+                >
+                  x
+                </button>
+              )}
               <p className="text-xs uppercase tracking-[0.24em] text-white/80">Total Items</p>
               <p className="mt-2 text-3xl font-bold">{items.length}</p>
               <p className="mt-2 text-sm text-white/85">LKR {totalStockValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} inventory value</p>
             </div>
-            <div className="rounded-3xl border border-red-200 bg-white p-5 shadow-sm">
+            )}
+            {isElementVisible('stock-inventory-el-header-stat-low-stock') && (
+              <div className="relative rounded-3xl border border-red-200 bg-white p-5 shadow-sm">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-el-header-stat-low-stock', true); }}
+                  className="absolute right-2 top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                  title="Hide low stock stat"
+                  aria-label="Hide low stock stat"
+                >
+                  x
+                </button>
+              )}
               <p className="text-xs uppercase tracking-[0.24em] text-red-500">Low Stock</p>
               <p className="mt-2 text-3xl font-bold text-slate-900">{lowStockItems}</p>
               <p className="mt-2 text-sm text-slate-500">Need replenishment attention</p>
             </div>
-            <div className="rounded-3xl border border-emerald-200 bg-white p-5 shadow-sm sm:col-span-2 lg:col-span-1">
+            )}
+            {isElementVisible('stock-inventory-el-header-stat-healthy-stock') && (
+              <div className="relative rounded-3xl border border-emerald-200 bg-white p-5 shadow-sm sm:col-span-2 lg:col-span-1">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-el-header-stat-healthy-stock', true); }}
+                  className="absolute right-2 top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-emerald-200 bg-white text-xs font-bold text-emerald-600 hover:bg-emerald-50"
+                  title="Hide healthy stock stat"
+                  aria-label="Hide healthy stock stat"
+                >
+                  x
+                </button>
+              )}
               <p className="text-xs uppercase tracking-[0.24em] text-emerald-600">Healthy Stock</p>
               <p className="mt-2 text-3xl font-bold text-slate-900">{inStockItems}</p>
               <p className="mt-2 text-sm text-slate-500">Above minimum stock threshold</p>
             </div>
+            )}
           </div>
         </div>
       </div>
+      )}
 
       <div className="overflow-hidden rounded-2xl border border-orange-100 bg-white shadow-[0_18px_65px_-35px_rgba(194,65,12,0.42)]">
         <div className="border-b border-orange-100 bg-gradient-to-r from-white via-orange-50/70 to-amber-50/70">
@@ -582,17 +1134,37 @@ export default function Inventory() {
         </div>
 
         <div className="p-6">
-          <div className="mb-6 overflow-hidden rounded-2xl border border-orange-100 bg-white shadow-sm">
+          {isElementVisible('stock-inventory-sec-filters') && (
+            <div className="relative mb-6 overflow-hidden rounded-2xl border border-orange-100 bg-white shadow-sm">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-sec-filters', true); }}
+                className="absolute right-3 top-3 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+                title="Hide filters section"
+                aria-label="Hide filters section"
+              >
+                x
+              </button>
+            )}
             <div className="border-b border-orange-100 bg-gradient-to-r from-white via-orange-50/70 to-amber-50/70 px-5 py-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h4 className="text-sm font-semibold uppercase tracking-[0.2em] text-orange-700">Filter Store</h4>
-                <p className="text-xs text-orange-700">
-                  Showing {filteredItems.length} of {items.length} items
-                </p>
+                <div className="text-right">
+                  <p className="text-xs text-orange-700">
+                    Showing {filteredItems.length} of {items.length} loaded items
+                  </p>
+                  {isBackgroundLoading && totalItemsCount > items.length && (
+                    <p className="mt-1 text-[11px] font-medium text-amber-700">
+                      Loading in background: {loadedItemsCount.toLocaleString()} / {totalItemsCount.toLocaleString()}
+                    </p>
+                  )}
+                </div>
               </div>
             </div>
             <div className="grid grid-cols-1 gap-4 p-5 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-              <div className="xl:col-span-2">
+              {isElementVisible('stock-inventory-el-filter-search') && (
+                <div className="xl:col-span-2">
                 <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Search</label>
                 <input
                   type="text"
@@ -602,7 +1174,9 @@ export default function Inventory() {
                   className={filterInputClass}
                 />
               </div>
-              <div>
+              )}
+              {isElementVisible('stock-inventory-el-filter-category') && (
+                <div>
                 <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Category</label>
                 <select
                   value={categoryFilter}
@@ -617,7 +1191,9 @@ export default function Inventory() {
                   ))}
                 </select>
               </div>
-              <div>
+              )}
+              {isElementVisible('stock-inventory-el-filter-supplier') && (
+                <div>
                 <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Supplier</label>
                 <select
                   value={supplierFilter}
@@ -632,7 +1208,9 @@ export default function Inventory() {
                   ))}
                 </select>
               </div>
-              <div>
+              )}
+              {isElementVisible('stock-inventory-el-filter-item-status') && (
+                <div>
                 <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Item Status</label>
                 <select
                   value={statusFilter}
@@ -644,7 +1222,9 @@ export default function Inventory() {
                   <option value="inactive">Inactive</option>
                 </select>
               </div>
-              <div>
+              )}
+              {isElementVisible('stock-inventory-el-filter-stock-state') && (
+                <div>
                 <label className="block text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Stock State</label>
                 <select
                   value={stockStateFilter}
@@ -658,7 +1238,9 @@ export default function Inventory() {
                   <option value="over_stock">Overstock</option>
                 </select>
               </div>
-              <div className="flex items-end md:col-span-2 lg:col-span-3 xl:col-span-6 xl:justify-end">
+              )}
+              {isElementVisible('stock-inventory-el-btn-reset-filters') && (
+                <div className="flex items-end md:col-span-2 lg:col-span-3 xl:col-span-6 xl:justify-end">
                 <button
                   type="button"
                   onClick={resetFilters}
@@ -667,16 +1249,43 @@ export default function Inventory() {
                   Reset Filters
                 </button>
               </div>
+              )}
             </div>
           </div>
+          )}
 
           {/* Stats Cards */}
-          <div className="mb-2 flex items-center justify-between rounded-2xl border border-orange-100 bg-orange-50/60 px-4 py-2.5">
-            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-orange-600">Inventory Snapshot</p>
-            <p className="text-xs text-orange-700">Tip: click any row to view full item details</p>
-          </div>
+          {isElementVisible('stock-inventory-el-snapshot-head') && (
+            <div className="relative mb-2 flex items-center justify-between rounded-2xl border border-orange-100 bg-orange-50/60 px-4 py-2.5">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-el-snapshot-head', true); }}
+                  className="absolute right-2 top-2 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+                  title="Hide snapshot header"
+                  aria-label="Hide snapshot header"
+                >
+                  x
+                </button>
+              )}
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-orange-600">Inventory Snapshot</p>
+              <p className="text-xs text-orange-700">Tip: click any row to view full item details</p>
+            </div>
+          )}
           <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4 mb-6">
-            <div className="overflow-hidden rounded-2xl border border-orange-100 bg-gradient-to-br from-orange-50 to-white">
+            {isElementVisible('stock-inventory-el-stat-total-items') && (
+              <div className="relative overflow-hidden rounded-2xl border border-orange-100 bg-gradient-to-br from-orange-50 to-white">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-el-stat-total-items', true); }}
+                  className="absolute right-2 top-2 z-10 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                  title="Hide total items card"
+                  aria-label="Hide total items card"
+                >
+                  x
+                </button>
+              )}
               <div className="p-5">
                 <div className="flex items-center">
                   <div className="flex-shrink-0">
@@ -697,8 +1306,21 @@ export default function Inventory() {
                 </div>
               </div>
             </div>
+            )}
 
-            <div className="overflow-hidden rounded-2xl border border-red-100 bg-gradient-to-br from-red-50 to-white">
+            {isElementVisible('stock-inventory-el-stat-low-stock') && (
+              <div className="relative overflow-hidden rounded-2xl border border-red-100 bg-gradient-to-br from-red-50 to-white">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-el-stat-low-stock', true); }}
+                  className="absolute right-2 top-2 z-10 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                  title="Hide low stock card"
+                  aria-label="Hide low stock card"
+                >
+                  x
+                </button>
+              )}
               <div className="p-5">
                 <div className="flex items-center">
                   <div className="flex-shrink-0">
@@ -719,8 +1341,21 @@ export default function Inventory() {
                 </div>
               </div>
             </div>
+            )}
 
-            <div className="overflow-hidden rounded-2xl border border-emerald-100 bg-gradient-to-br from-emerald-50 to-white">
+            {isElementVisible('stock-inventory-el-stat-in-stock') && (
+              <div className="relative overflow-hidden rounded-2xl border border-emerald-100 bg-gradient-to-br from-emerald-50 to-white">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-el-stat-in-stock', true); }}
+                  className="absolute right-2 top-2 z-10 inline-flex h-6 w-6 items-center justify-center rounded-full border border-emerald-200 bg-white text-xs font-bold text-emerald-600 hover:bg-emerald-50"
+                  title="Hide in stock card"
+                  aria-label="Hide in stock card"
+                >
+                  x
+                </button>
+              )}
               <div className="p-5">
                 <div className="flex items-center">
                   <div className="flex-shrink-0">
@@ -741,8 +1376,21 @@ export default function Inventory() {
                 </div>
               </div>
             </div>
+            )}
 
-            <div className="overflow-hidden rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50 to-white">
+            {isElementVisible('stock-inventory-el-stat-total-value') && (
+              <div className="relative overflow-hidden rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50 to-white">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-el-stat-total-value', true); }}
+                  className="absolute right-2 top-2 z-10 inline-flex h-6 w-6 items-center justify-center rounded-full border border-blue-200 bg-white text-xs font-bold text-blue-600 hover:bg-blue-50"
+                  title="Hide total value card"
+                  aria-label="Hide total value card"
+                >
+                  x
+                </button>
+              )}
               <div className="p-5">
                 <div className="flex items-center">
                   <div className="flex-shrink-0">
@@ -763,6 +1411,7 @@ export default function Inventory() {
                 </div>
               </div>
             </div>
+            )}
           </div>
 
           {/* Items Table */}
@@ -792,7 +1441,19 @@ export default function Inventory() {
               </button>
             </div>
           ) : (
-            <div className="overflow-hidden rounded-2xl border border-orange-100 bg-white shadow-[0_16px_55px_-35px_rgba(194,65,12,0.45)]">
+            isElementVisible('stock-inventory-sec-table') && (
+            <div className="relative overflow-hidden rounded-2xl border border-orange-100 bg-white shadow-[0_16px_55px_-35px_rgba(194,65,12,0.45)]">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-sec-table', true); }}
+                  className="absolute right-3 top-3 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+                  title="Hide table section"
+                  aria-label="Hide table section"
+                >
+                  x
+                </button>
+              )}
               <div className="border-b border-orange-100 bg-gradient-to-r from-slate-900 via-orange-900 to-amber-800 px-5 py-3.5">
                 <h4 className="text-sm font-semibold uppercase tracking-[0.2em] text-amber-100">
                   Finished Goods Inventory
@@ -802,28 +1463,106 @@ export default function Inventory() {
               <table className="min-w-full divide-y divide-slate-200">
                 <thead className="bg-slate-100/80">
                   <tr>
-                    <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-[0.16em]">
-                      Item
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-[0.16em]">
-                      Stock Info
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-[0.16em]">
-                      Batch
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-[0.16em]">
-                      Price
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-[0.16em]">
-                      Status
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-[0.16em]">
-                      Actions
-                    </th>
+                    {isColumnVisible('stock-inventory-col-item') && (
+                      <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-[0.16em] relative">
+                        Item
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-col-item', true); }}
+                            className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                            title="Hide item column"
+                            aria-label="Hide item column"
+                          >
+                            x
+                          </button>
+                        )}
+                      </th>
+                    )}
+                    {isColumnVisible('stock-inventory-col-stock-info') && (
+                      <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-[0.16em] relative">
+                        Stock Info
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-col-stock-info', true); }}
+                            className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                            title="Hide stock info column"
+                            aria-label="Hide stock info column"
+                          >
+                            x
+                          </button>
+                        )}
+                      </th>
+                    )}
+                    {isColumnVisible('stock-inventory-col-batch') && (
+                      <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-[0.16em] relative">
+                        Batch
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-col-batch', true); }}
+                            className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                            title="Hide batch column"
+                            aria-label="Hide batch column"
+                          >
+                            x
+                          </button>
+                        )}
+                      </th>
+                    )}
+                    {isColumnVisible('stock-inventory-col-price') && (
+                      <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-[0.16em] relative">
+                        Price
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-col-price', true); }}
+                            className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                            title="Hide price column"
+                            aria-label="Hide price column"
+                          >
+                            x
+                          </button>
+                        )}
+                      </th>
+                    )}
+                    {isColumnVisible('stock-inventory-col-status') && (
+                      <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-[0.16em] relative">
+                        Status
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-col-status', true); }}
+                            className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                            title="Hide status column"
+                            aria-label="Hide status column"
+                          >
+                            x
+                          </button>
+                        )}
+                      </th>
+                    )}
+                    {isColumnVisible('stock-inventory-col-actions') && (
+                      <th className="px-6 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-[0.16em] relative">
+                        Actions
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleInventoryVisibilityToggle('stock-inventory-col-actions', true); }}
+                            className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full border border-red-200 bg-white text-[10px] font-bold text-red-600 hover:bg-red-50"
+                            title="Hide actions column"
+                            aria-label="Hide actions column"
+                          >
+                            x
+                          </button>
+                        )}
+                      </th>
+                    )}
                   </tr>
                 </thead>
                 <tbody className="bg-white divide-y divide-slate-200">
-                  {filteredItems.map((item) => {
+                  {paginatedItems.map((item) => {
                     const stockStatus = getStockStatus(item);
                     const resolvedPrice = resolveItemPrice(item);
                     const info = resolveAdditionalInfo(item);
@@ -838,7 +1577,8 @@ export default function Inventory() {
                         onClick={() => openItemDetails(item)}
                         className="cursor-pointer transition hover:bg-orange-50/45"
                       >
-                        <td className="px-6 py-4 whitespace-nowrap">
+                        {isColumnVisible('stock-inventory-col-item') && (
+                          <td className="px-6 py-4 whitespace-nowrap">
                           <div className="flex items-center">
                             <div className="flex-shrink-0 h-10 w-10">
                               <div className="h-10 w-10 rounded-full bg-orange-100 flex items-center justify-center">
@@ -857,7 +1597,9 @@ export default function Inventory() {
                             </div>
                           </div>
                         </td>
-                        <td className="px-6 py-4 whitespace-nowrap">
+                        )}
+                        {isColumnVisible('stock-inventory-col-stock-info') && (
+                          <td className="px-6 py-4 whitespace-nowrap">
                           <div className="text-sm text-gray-900">
                             {item.current_stock} {item.unit}
                           </div>
@@ -870,7 +1612,9 @@ export default function Inventory() {
                             </div>
                           )}
                         </td>
-                        <td className="px-6 py-4 whitespace-nowrap">
+                        )}
+                        {isColumnVisible('stock-inventory-col-batch') && (
+                          <td className="px-6 py-4 whitespace-nowrap">
                           <div className="text-sm text-gray-900">
                             {batchNo || labelCode || (packagingBatchId ? `Batch #${packagingBatchId}` : '-')}
                           </div>
@@ -895,15 +1639,21 @@ export default function Inventory() {
                             <div className="text-xs text-amber-600 mt-1">Not synced from packaging yet</div>
                           )}
                         </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm font-semibold text-slate-800">
+                        )}
+                        {isColumnVisible('stock-inventory-col-price') && (
+                          <td className="px-6 py-4 whitespace-nowrap text-sm font-semibold text-slate-800">
                           LKR {resolvedPrice.toFixed(2)}
                         </td>
-                        <td className="px-6 py-4 whitespace-nowrap">
+                        )}
+                        {isColumnVisible('stock-inventory-col-status') && (
+                          <td className="px-6 py-4 whitespace-nowrap">
                           <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${stockStatus.color}`}>
                             {stockStatus.status}
                           </span>
                         </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                        )}
+                        {isColumnVisible('stock-inventory-col-actions') && (
+                          <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
@@ -923,16 +1673,344 @@ export default function Inventory() {
                             Delete
                           </button>
                         </td>
+                        )}
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
             </div>
+            <div className="flex flex-col gap-3 border-t border-orange-100 bg-orange-50/40 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="text-xs text-slate-600">
+                Showing {pageStart} to {pageEnd} of {filteredItems.length} items
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Rows</label>
+                <select
+                  value={rowsPerPage}
+                  onChange={(e) => {
+                    setRowsPerPage(Number(e.target.value));
+                    setCurrentPage(1);
+                  }}
+                  className="rounded-lg border border-orange-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700"
+                >
+                  <option value={10}>10</option>
+                  <option value={25}>25</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                </select>
+
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
+                  disabled={currentPage === 1}
+                  className="rounded-full border border-orange-200 bg-white px-3 py-1.5 text-xs font-semibold text-orange-700 transition hover:bg-orange-100 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Previous
+                </button>
+
+                <div className="flex items-center gap-1">
+                  {paginationPages.map((page, index) =>
+                    page === -1 ? (
+                      <span key={`ellipsis-${index}`} className="px-1 text-xs text-slate-500">
+                        ...
+                      </span>
+                    ) : (
+                      <button
+                        key={page}
+                        type="button"
+                        onClick={() => setCurrentPage(page)}
+                        className={`h-8 min-w-8 rounded-full px-2 text-xs font-semibold transition ${
+                          page === currentPage
+                            ? 'bg-orange-500 text-white shadow-sm'
+                            : 'border border-orange-200 bg-white text-orange-700 hover:bg-orange-100'
+                        }`}
+                      >
+                        {page}
+                      </button>
+                    )
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage((prev) => Math.min(totalPages, prev + 1))}
+                  disabled={currentPage === totalPages}
+                  className="rounded-full border border-orange-200 bg-white px-3 py-1.5 text-xs font-semibold text-orange-700 transition hover:bg-orange-100 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Next
+                </button>
+              </div>
             </div>
-          )}
+            </div>
+          ))}
         </div>
       </div>
+
+      {/* Item Details Modal */}
+      {showImportModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-md">
+          <div className="relative w-full max-w-3xl overflow-hidden rounded-[30px] border border-white/20 bg-white shadow-[0_34px_120px_-40px_rgba(16,185,129,0.55)]">
+            <div className="absolute inset-x-0 top-0 h-40 bg-[radial-gradient(circle_at_top_left,_rgba(110,231,183,0.32),_transparent_45%),linear-gradient(125deg,_rgba(5,150,105,0.95)_0%,_rgba(16,185,129,0.94)_45%,_rgba(52,211,153,0.9)_100%)]"></div>
+            <div className="relative max-h-[90vh] overflow-y-auto">
+              <div className="flex items-start justify-between gap-4 px-6 pb-6 pt-7 text-white sm:px-8">
+                <div>
+                  <div className="mb-4 inline-flex h-12 w-12 items-center justify-center rounded-2xl border border-white/25 bg-white/15 text-2xl">
+                    ⬆️
+                  </div>
+                  <h3 className="text-2xl font-semibold tracking-tight sm:text-3xl">Import Inventory from CSV</h3>
+                  <p className="mt-2 text-sm text-white/85 sm:text-base">
+                    Upload a CSV file to create or update inventory records by item code.
+                  </p>
+                </div>
+                <button
+                  onClick={() => {
+                    if (importing) return;
+                    setShowImportModal(false);
+                  }}
+                  className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-white/25 bg-white/10 text-white transition hover:bg-white/20"
+                >
+                  <svg className="h-6 w-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+
+              <form onSubmit={handleImportCsv} className="space-y-5 px-6 pb-6 sm:px-8 sm:pb-8">
+                <section className="rounded-3xl border border-emerald-100 bg-white p-5 shadow-sm">
+                  <p className="text-xs font-semibold uppercase tracking-[0.22em] text-emerald-600">CSV Template</p>
+                  <p className="mt-2 text-sm text-slate-600">
+                    Reference format (like your attachment): first column = code, second = name, third = price.
+                    Example row: 34014,PIN KICK STARTER PAWL,190.00
+                  </p>
+                  <p className="mt-2 text-xs text-slate-500">
+                    Works with or without header row. Optional 4th column can be current_stock; if missing it becomes 0.
+                  </p>
+                </section>
+
+                <section className="rounded-3xl border border-emerald-100 bg-white p-5 shadow-sm">
+                  <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                    <div>
+                      <label className="block text-xs font-semibold uppercase tracking-[0.2em] text-gray-600">Supplier (Optional)</label>
+                      <select
+                        value={importSupplierId}
+                        onChange={(e) => setImportSupplierId(e.target.value)}
+                        className="mt-2 block w-full rounded-xl border border-emerald-200 bg-white px-3.5 py-2.5 text-sm text-gray-800"
+                      >
+                        <option value="">Use CSV supplier or keep empty</option>
+                        {suppliers.map((supplier) => (
+                          <option key={supplier.id} value={String(supplier.id)}>
+                            {supplier.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="rounded-2xl border border-emerald-200 bg-emerald-50/40 p-3">
+                      <label className="inline-flex items-center gap-2 text-sm font-semibold text-emerald-800">
+                        <input
+                          type="checkbox"
+                          checked={importUseDiscount}
+                          onChange={(e) => {
+                            const checked = e.target.checked;
+                            setImportUseDiscount(checked);
+                            if (checked) {
+                              setImportUseProfit(false);
+                            }
+                          }}
+                          className="h-4 w-4 rounded border-emerald-300 text-emerald-600"
+                        />
+                        Apply Discount From Document Price
+                      </label>
+                      <p className="mt-1 text-xs text-emerald-700">
+                        With discount: sell_price = document price, unit_price = document price, purchase_price = document price - discount.
+                      </p>
+                    </div>
+
+                    <div className="rounded-2xl border border-blue-200 bg-blue-50/40 p-3">
+                      <label className="inline-flex items-center gap-2 text-sm font-semibold text-blue-800">
+                        <input
+                          type="checkbox"
+                          checked={importUseProfit}
+                          onChange={(e) => {
+                            const checked = e.target.checked;
+                            setImportUseProfit(checked);
+                            if (checked) {
+                              setImportUseDiscount(false);
+                            }
+                          }}
+                          className="h-4 w-4 rounded border-blue-300 text-blue-600"
+                        />
+                        Apply Profit From Document Price
+                      </label>
+                      <p className="mt-1 text-xs text-blue-700">
+                        With profit: sell_price = document price + profit, unit_price = document price + profit, purchase_price = document price.
+                      </p>
+                    </div>
+                  </div>
+
+                  {importUseDiscount && (
+                    <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+                      <div>
+                        <label className="block text-xs font-semibold uppercase tracking-[0.2em] text-gray-600">Discount Type</label>
+                        <select
+                          value={importDiscountMode}
+                          onChange={(e) => setImportDiscountMode(e.target.value as 'amount' | 'percent')}
+                          className="mt-2 block w-full rounded-xl border border-emerald-200 bg-white px-3.5 py-2.5 text-sm text-gray-800"
+                        >
+                          <option value="amount">Amount</option>
+                          <option value="percent">Percent (%)</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold uppercase tracking-[0.2em] text-gray-600">
+                          Discount {importDiscountMode === 'percent' ? '(%)' : '(LKR)'}
+                        </label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={importDiscountValue}
+                          onChange={(e) => setImportDiscountValue(e.target.value)}
+                          className="mt-2 block w-full rounded-xl border border-emerald-200 bg-white px-3.5 py-2.5 text-sm text-gray-800"
+                          placeholder={importDiscountMode === 'percent' ? '10' : '250.00'}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {importUseProfit && (
+                    <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+                      <div>
+                        <label className="block text-xs font-semibold uppercase tracking-[0.2em] text-gray-600">Profit Type</label>
+                        <select
+                          value={importProfitMode}
+                          onChange={(e) => setImportProfitMode(e.target.value as 'amount' | 'percent')}
+                          className="mt-2 block w-full rounded-xl border border-blue-200 bg-white px-3.5 py-2.5 text-sm text-gray-800"
+                        >
+                          <option value="amount">Amount</option>
+                          <option value="percent">Percent (%)</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-xs font-semibold uppercase tracking-[0.2em] text-gray-600">
+                          Profit {importProfitMode === 'percent' ? '(%)' : '(LKR)'}
+                        </label>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          value={importProfitValue}
+                          onChange={(e) => setImportProfitValue(e.target.value)}
+                          className="mt-2 block w-full rounded-xl border border-blue-200 bg-white px-3.5 py-2.5 text-sm text-gray-800"
+                          placeholder={importProfitMode === 'percent' ? '15' : '300.00'}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="mt-4 border-t border-emerald-100 pt-4">
+                  <label className="block text-xs font-semibold uppercase tracking-[0.2em] text-gray-600">CSV File</label>
+                  <input
+                    type="file"
+                    accept=".csv,text/csv"
+                    onChange={(e) => setImportFile(e.target.files?.[0] || null)}
+                    className="mt-2 block w-full rounded-xl border border-emerald-200 bg-white px-3.5 py-2.5 text-sm text-gray-800"
+                    required
+                  />
+                  {importFile && (
+                    <p className="mt-2 text-xs text-slate-600">
+                      Selected: {importFile.name}
+                    </p>
+                  )}
+                  </div>
+                </section>
+
+                {importing && (
+                  <section className="rounded-3xl border border-amber-200 bg-amber-50/50 p-5 shadow-sm">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-sm font-semibold text-amber-800">
+                        {importProgressPhase === 'processing'
+                          ? 'Upload complete. Processing inventory rows...'
+                          : 'Uploading CSV file...'}
+                      </p>
+                      <span className="text-xs font-semibold uppercase tracking-[0.16em] text-amber-700">
+                        {Math.max(0, Math.min(100, Math.round(importProgress)))}%
+                      </span>
+                    </div>
+                    <div className="mt-3 h-2.5 w-full overflow-hidden rounded-full bg-amber-100">
+                      <div
+                        className={`h-full rounded-full bg-gradient-to-r from-amber-500 via-orange-500 to-emerald-500 transition-all duration-300 ${
+                          importProgressPhase === 'processing' ? 'animate-pulse' : ''
+                        }`}
+                        style={{ width: `${Math.max(0, Math.min(100, importProgress))}%` }}
+                      />
+                    </div>
+                    <p className="mt-2 text-xs text-amber-700">
+                      {importProgressPhase === 'processing'
+                        ? 'Please wait while we validate and save rows on the server.'
+                        : 'Keep this dialog open until import completes.'}
+                    </p>
+                  </section>
+                )}
+
+                {importSummary && (
+                  <section className="rounded-3xl border border-emerald-100 bg-emerald-50/40 p-5 shadow-sm">
+                    <p className="text-xs font-semibold uppercase tracking-[0.22em] text-emerald-700">Import Result</p>
+                    <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                      <div className="rounded-xl bg-white p-3 text-center">
+                        <p className="text-xs text-slate-500">Created</p>
+                        <p className="text-lg font-bold text-emerald-700">{importSummary.created}</p>
+                      </div>
+                      <div className="rounded-xl bg-white p-3 text-center">
+                        <p className="text-xs text-slate-500">Updated</p>
+                        <p className="text-lg font-bold text-blue-700">{importSummary.updated}</p>
+                      </div>
+                      <div className="rounded-xl bg-white p-3 text-center">
+                        <p className="text-xs text-slate-500">Skipped</p>
+                        <p className="text-lg font-bold text-amber-700">{importSummary.skipped}</p>
+                      </div>
+                      <div className="rounded-xl bg-white p-3 text-center">
+                        <p className="text-xs text-slate-500">Failed</p>
+                        <p className="text-lg font-bold text-red-700">{importSummary.failed}</p>
+                      </div>
+                    </div>
+
+                    {importSummary.errors.length > 0 && (
+                      <div className="mt-4 rounded-2xl border border-red-200 bg-white p-3">
+                        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-red-600">Row Errors</p>
+                        <div className="mt-2 max-h-40 space-y-1 overflow-y-auto pr-1 text-xs text-red-700">
+                          {importSummary.errors.map((error, index) => (
+                            <p key={`${error.row}-${index}`}>Row {error.row}: {error.message}</p>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </section>
+                )}
+
+                <div className="sticky bottom-0 -mx-6 flex justify-end gap-3 border-t border-emerald-100 bg-white/95 px-6 py-4 sm:-mx-8 sm:px-8">
+                  <button
+                    type="button"
+                    onClick={() => setShowImportModal(false)}
+                    disabled={importing}
+                    className="rounded-full border border-emerald-200 bg-white px-5 py-2.5 text-sm font-semibold text-gray-700 transition hover:bg-emerald-50 disabled:opacity-60"
+                  >
+                    Close
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={importing || !importFile}
+                    className="rounded-full bg-gradient-to-r from-emerald-500 to-teal-500 px-6 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:from-emerald-600 hover:to-teal-600 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {importing ? 'Importing...' : 'Import CSV'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Item Details Modal */}
       {showItemDetailsModal && selectedItemDetails && (
@@ -1310,3 +2388,19 @@ export default function Inventory() {
     </div>
   );
 }
+
+interface InventoryMemoryCacheEntry {
+  timestamp: number;
+  items: InventoryItem[];
+  loadedItemsCount: number;
+  totalItemsCount: number;
+  isBackgroundLoading: boolean;
+}
+
+interface SuppliersMemoryCacheEntry {
+  timestamp: number;
+  suppliers: any[];
+}
+
+const inventoryMemoryCache: Record<string, InventoryMemoryCacheEntry> = {};
+let suppliersMemoryCache: SuppliersMemoryCacheEntry | null = null;

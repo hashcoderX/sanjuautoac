@@ -62,8 +62,13 @@ const DEFAULT_LEAVE_TYPES: LeaveType[] = [
   { id: -10, name: 'Medical / Hospitalization Leave', code: 'medical_hospitalization', description: 'Medical / hospitalization leave', max_days_per_year: 30, requires_documentation: true, is_active: true },
 ];
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
 export default function Leaves() {
   const [token, setToken] = useState('');
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [leaves, setLeaves] = useState<Leave[]>([]);
   const [leaveTypes, setLeaveTypes] = useState<LeaveType[]>([]);
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -74,6 +79,10 @@ export default function Leaves() {
   const [editingLeaveType, setEditingLeaveType] = useState<LeaveType | null>(null);
   const router = useRouter();
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+
+  const isColumnVisible = (key: string) => !hiddenModules.includes(key);
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
 
   // Form fields for leave request
   const [employeeId, setEmployeeId] = useState('');
@@ -104,11 +113,109 @@ export default function Leaves() {
   const [confirmAction, setConfirmAction] = useState<(() => Promise<void> | void) | null>(null);
 
   useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchAccessProfile = async (authToken: string) => {
+    try {
+      const [userRes, visibilityRes] = await Promise.all([
+        axios.get(`${API_URL}/api/user`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+      ]);
+
+      const superAdmin = isSuperAdminUser(userRes.data || {});
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching leaves page visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleLeaveVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating leave widget visibility:', error);
+      showNotice('Update Failed', 'Unable to update widget visibility. Please try again.', 'error');
+    }
+  };
+
+  useEffect(() => {
     const storedToken = localStorage.getItem('token');
     if (!storedToken) {
       router.push('/');
     } else {
       setToken(storedToken);
+      fetchAccessProfile(storedToken);
       fetchLeaves(storedToken);
       fetchLeaveTypes(storedToken);
       fetchEmployees(storedToken);
@@ -450,65 +557,180 @@ export default function Leaves() {
 
       <main className="relative z-10 max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
         {/* Hero Section */}
-        <div className="text-center mb-12">
-          <div className="inline-block p-1 bg-gradient-to-r from-blue-500 to-cyan-500 rounded-full mb-6">
-            <div className="bg-white rounded-full p-4">
-              <span className="text-4xl">🏖️</span>
+        {isElementVisible('hrm-leaves-el-title') && (
+          <div className="relative text-center mb-12">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-el-title', true); }}
+                className="absolute top-0 right-0 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                title="Hide section"
+                aria-label="Hide leave title section"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M18 6 6 18" />
+                  <path d="m6 6 12 12" />
+                </svg>
+              </button>
+            )}
+            <div className="inline-block p-1 bg-gradient-to-r from-blue-500 to-cyan-500 rounded-full mb-6">
+              <div className="bg-white rounded-full p-4">
+                <span className="text-4xl">🏖️</span>
+              </div>
+            </div>
+            <h2 className="text-3xl sm:text-4xl md:text-5xl font-bold text-gray-900 mb-4">
+              Leave <span className="bg-gradient-to-r from-blue-600 to-cyan-600 bg-clip-text text-transparent">Management</span>
+            </h2>
+            <p className="text-base sm:text-lg md:text-xl text-gray-600 max-w-3xl mx-auto leading-relaxed mb-6 px-2">
+              Manage employee leave requests with a streamlined two-stage approval process.
+              From request submission to final HR approval, handle everything efficiently.
+            </p>
+            <div className="flex flex-col sm:flex-row justify-center gap-4 sm:space-x-6 sm:gap-0">
+              {isElementVisible('hrm-leaves-el-stat-pending') && (
+                <div className="relative text-center">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-el-stat-pending', true); }}
+                      className="absolute -top-2 -right-3 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide stat"
+                      aria-label="Hide pending stat"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  <div className="text-xl sm:text-2xl font-bold text-blue-600">
+                    {leaves.filter(l => l.status === 'pending').length}
+                  </div>
+                  <div className="text-sm text-gray-500">Pending Requests</div>
+                </div>
+              )}
+              {isElementVisible('hrm-leaves-el-stat-approved') && (
+                <div className="relative text-center">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-el-stat-approved', true); }}
+                      className="absolute -top-2 -right-3 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide stat"
+                      aria-label="Hide approved stat"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  <div className="text-xl sm:text-2xl font-bold text-green-600">
+                    {leaves.filter(l => l.status === 'approved').length}
+                  </div>
+                  <div className="text-sm text-gray-500">Approved This Month</div>
+                </div>
+              )}
+              {isElementVisible('hrm-leaves-el-stat-types') && (
+                <div className="relative text-center">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-el-stat-types', true); }}
+                      className="absolute -top-2 -right-3 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide stat"
+                      aria-label="Hide leave types stat"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  <div className="text-xl sm:text-2xl font-bold text-purple-600">
+                    {leaveTypes.length}
+                  </div>
+                  <div className="text-sm text-gray-500">Leave Types</div>
+                </div>
+              )}
             </div>
           </div>
-          <h2 className="text-3xl sm:text-4xl md:text-5xl font-bold text-gray-900 mb-4">
-            Leave <span className="bg-gradient-to-r from-blue-600 to-cyan-600 bg-clip-text text-transparent">Management</span>
-          </h2>
-          <p className="text-base sm:text-lg md:text-xl text-gray-600 max-w-3xl mx-auto leading-relaxed mb-6 px-2">
-            Manage employee leave requests with a streamlined two-stage approval process.
-            From request submission to final HR approval, handle everything efficiently.
-          </p>
-          <div className="flex flex-col sm:flex-row justify-center gap-4 sm:space-x-6 sm:gap-0">
-            <div className="text-center">
-              <div className="text-xl sm:text-2xl font-bold text-blue-600">
-                {leaves.filter(l => l.status === 'pending').length}
-              </div>
-              <div className="text-sm text-gray-500">Pending Requests</div>
-            </div>
-            <div className="text-center">
-              <div className="text-xl sm:text-2xl font-bold text-green-600">
-                {leaves.filter(l => l.status === 'approved').length}
-              </div>
-              <div className="text-sm text-gray-500">Approved This Month</div>
-            </div>
-            <div className="text-center">
-              <div className="text-xl sm:text-2xl font-bold text-purple-600">
-                {leaveTypes.length}
-              </div>
-              <div className="text-sm text-gray-500">Leave Types</div>
-            </div>
-          </div>
-        </div>
+        )}
 
         {/* Action Buttons */}
         <div className="flex flex-wrap gap-4 mb-8">
-          <button
-            onClick={() => setShowForm(true)}
-            className="bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white px-6 py-3 rounded-xl font-medium transition-all duration-300 transform hover:scale-105 shadow-lg hover:shadow-xl flex items-center space-x-2"
-          >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-            </svg>
-            <span>New Leave Request</span>
-          </button>
-          <button
-            onClick={() => setShowLeaveTypesModal(true)}
-            className="bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white px-6 py-3 rounded-xl font-medium transition-all duration-300 transform hover:scale-105 shadow-lg hover:shadow-xl flex items-center space-x-2"
-          >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
-            </svg>
-            <span>Manage Leave Types</span>
-          </button>
+          {isElementVisible('hrm-leaves-el-btn-new') && (
+            <div className="relative">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-el-btn-new', true); }}
+                  className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                  title="Hide button"
+                  aria-label="Hide new leave request button"
+                >
+                  <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M18 6 6 18" />
+                    <path d="m6 6 12 12" />
+                  </svg>
+                </button>
+              )}
+              <button
+                onClick={() => setShowForm(true)}
+                className="bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600 text-white px-6 py-3 rounded-xl font-medium transition-all duration-300 transform hover:scale-105 shadow-lg hover:shadow-xl flex items-center space-x-2"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+                </svg>
+                <span>New Leave Request</span>
+              </button>
+            </div>
+          )}
+          {isElementVisible('hrm-leaves-el-btn-types') && (
+            <div className="relative">
+              {showWidgetCloseButtons && (
+                <button
+                  type="button"
+                  onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-el-btn-types', true); }}
+                  className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                  title="Hide button"
+                  aria-label="Hide manage leave types button"
+                >
+                  <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M18 6 6 18" />
+                    <path d="m6 6 12 12" />
+                  </svg>
+                </button>
+              )}
+              <button
+                onClick={() => setShowLeaveTypesModal(true)}
+                className="bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white px-6 py-3 rounded-xl font-medium transition-all duration-300 transform hover:scale-105 shadow-lg hover:shadow-xl flex items-center space-x-2"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                </svg>
+                <span>Manage Leave Types</span>
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Leave Requests List */}
-        <div className="bg-white/70 backdrop-blur-sm shadow-xl rounded-2xl border border-white/20 overflow-hidden">
+        {isElementVisible('hrm-leaves-sec-requests') && (
+        <div className="relative bg-white/70 backdrop-blur-sm shadow-xl rounded-2xl border border-white/20 overflow-hidden">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-sec-requests', true); }}
+              className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide section"
+              aria-label="Hide leave requests section"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
           <div className="bg-gradient-to-r from-blue-500 to-cyan-500 p-6">
             <div className="flex items-center space-x-3">
               <div className="w-12 h-12 bg-white/20 rounded-xl flex items-center justify-center text-2xl">
@@ -525,117 +747,258 @@ export default function Leaves() {
             <table className="min-w-full divide-y divide-gray-200">
               <thead className="bg-gray-50">
                 <tr>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Employee
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Leave Type
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Duration
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Status
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Section Head
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    HR Approval
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Actions
-                  </th>
+                  {isColumnVisible('hrm-leaves-col-employee') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Employee</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-col-employee', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Employee column"
+                            aria-label="Hide Employee column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-leaves-col-type') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Leave Type</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-col-type', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Leave Type column"
+                            aria-label="Hide Leave Type column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-leaves-col-duration') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Duration</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-col-duration', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Duration column"
+                            aria-label="Hide Duration column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-leaves-col-status') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Status</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-col-status', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Status column"
+                            aria-label="Hide Status column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-leaves-col-section-head') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Section Head</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-col-section-head', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Section Head column"
+                            aria-label="Hide Section Head column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-leaves-col-hr-approval') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>HR Approval</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-col-hr-approval', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide HR Approval column"
+                            aria-label="Hide HR Approval column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-leaves-col-actions') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Actions</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleLeaveVisibilityToggle('hrm-leaves-col-actions', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Actions column"
+                            aria-label="Hide Actions column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
                 {leaves.map((leave) => (
                   <tr key={leave.id} className="hover:bg-gray-50 transition-colors duration-200">
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <div className="text-sm font-semibold text-gray-900">
-                        {leave.employee.first_name} {leave.employee.last_name}
-                      </div>
-                      <div className="text-sm text-gray-500">{leave.employee.employee_code}</div>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      {leave.leave_type}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      <div>{new Date(leave.start_date).toLocaleDateString()}</div>
-                      <div className="text-gray-500">to {new Date(leave.end_date).toLocaleDateString()}</div>
-                      <div className="text-xs text-gray-500">{leave.days_requested} days</div>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <span className={`inline-flex px-3 py-1 text-xs font-semibold rounded-full ${
-                        leave.status === 'approved'
-                          ? 'bg-green-100 text-green-800'
-                          : leave.status === 'rejected'
-                          ? 'bg-red-100 text-red-800'
-                          : leave.status === 'section_head_approved'
-                          ? 'bg-yellow-100 text-yellow-800'
-                          : 'bg-gray-100 text-gray-800'
-                      }`}>
-                        {leave.status.replace('_', ' ').toUpperCase()}
-                      </span>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      <div className={`w-3 h-3 rounded-full mx-auto ${
-                        leave.section_head_approved ? 'bg-green-500' : 'bg-gray-300'
-                      }`}></div>
-                      {leave.section_head_approved && leave.sectionHeadApprover && (
-                        <div className="text-xs text-gray-500 mt-1 text-center">
-                          {leave.sectionHeadApprover.first_name}
+                    {isColumnVisible('hrm-leaves-col-employee') && (
+                      <td className="px-6 py-4 whitespace-nowrap">
+                        <div className="text-sm font-semibold text-gray-900">
+                          {leave.employee.first_name} {leave.employee.last_name}
                         </div>
-                      )}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      <div className={`w-3 h-3 rounded-full mx-auto ${
-                        leave.hr_approved ? 'bg-green-500' : 'bg-gray-300'
-                      }`}></div>
-                      {leave.hr_approved && leave.hrApprover && (
-                        <div className="text-xs text-gray-500 mt-1 text-center">
-                          {leave.hrApprover.first_name}
+                        <div className="text-sm text-gray-500">{leave.employee.employee_code}</div>
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-leaves-col-type') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        {leave.leave_type}
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-leaves-col-duration') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        <div>{new Date(leave.start_date).toLocaleDateString()}</div>
+                        <div className="text-gray-500">to {new Date(leave.end_date).toLocaleDateString()}</div>
+                        <div className="text-xs text-gray-500">{leave.days_requested} days</div>
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-leaves-col-status') && (
+                      <td className="px-6 py-4 whitespace-nowrap">
+                        <span className={`inline-flex px-3 py-1 text-xs font-semibold rounded-full ${
+                          leave.status === 'approved'
+                            ? 'bg-green-100 text-green-800'
+                            : leave.status === 'rejected'
+                            ? 'bg-red-100 text-red-800'
+                            : leave.status === 'section_head_approved'
+                            ? 'bg-yellow-100 text-yellow-800'
+                            : 'bg-gray-100 text-gray-800'
+                        }`}>
+                          {leave.status.replace('_', ' ').toUpperCase()}
+                        </span>
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-leaves-col-section-head') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        <div className={`w-3 h-3 rounded-full mx-auto ${
+                          leave.section_head_approved ? 'bg-green-500' : 'bg-gray-300'
+                        }`}></div>
+                        {leave.section_head_approved && leave.sectionHeadApprover && (
+                          <div className="text-xs text-gray-500 mt-1 text-center">
+                            {leave.sectionHeadApprover.first_name}
+                          </div>
+                        )}
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-leaves-col-hr-approval') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        <div className={`w-3 h-3 rounded-full mx-auto ${
+                          leave.hr_approved ? 'bg-green-500' : 'bg-gray-300'
+                        }`}></div>
+                        {leave.hr_approved && leave.hrApprover && (
+                          <div className="text-xs text-gray-500 mt-1 text-center">
+                            {leave.hrApprover.first_name}
+                          </div>
+                        )}
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-leaves-col-actions') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                        <div className="flex space-x-2">
+                          {leave.status === 'pending' && (
+                            <button
+                              onClick={() => openApprovalModal(leave, 'section_head')}
+                              className="text-blue-600 hover:text-blue-900 bg-blue-50 hover:bg-blue-100 px-3 py-1 rounded text-xs"
+                            >
+                              Section Head
+                            </button>
+                          )}
+                          {leave.status === 'section_head_approved' && (
+                            <button
+                              onClick={() => openApprovalModal(leave, 'hr')}
+                              className="text-green-600 hover:text-green-900 bg-green-50 hover:bg-green-100 px-3 py-1 rounded text-xs"
+                            >
+                              HR Approve
+                            </button>
+                          )}
+                          <button
+                            onClick={() => handleEdit(leave)}
+                            className="text-gray-600 hover:text-gray-900 bg-gray-50 hover:bg-gray-100 px-3 py-1 rounded text-xs"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            onClick={() => confirmDeleteLeave(leave)}
+                            className="text-red-600 hover:text-red-900 bg-red-50 hover:bg-red-100 px-3 py-1 rounded text-xs"
+                          >
+                            Delete
+                          </button>
                         </div>
-                      )}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
-                      <div className="flex space-x-2">
-                        {leave.status === 'pending' && (
-                          <button
-                            onClick={() => openApprovalModal(leave, 'section_head')}
-                            className="text-blue-600 hover:text-blue-900 bg-blue-50 hover:bg-blue-100 px-3 py-1 rounded text-xs"
-                          >
-                            Section Head
-                          </button>
-                        )}
-                        {leave.status === 'section_head_approved' && (
-                          <button
-                            onClick={() => openApprovalModal(leave, 'hr')}
-                            className="text-green-600 hover:text-green-900 bg-green-50 hover:bg-green-100 px-3 py-1 rounded text-xs"
-                          >
-                            HR Approve
-                          </button>
-                        )}
-                        <button
-                          onClick={() => handleEdit(leave)}
-                          className="text-gray-600 hover:text-gray-900 bg-gray-50 hover:bg-gray-100 px-3 py-1 rounded text-xs"
-                        >
-                          Edit
-                        </button>
-                        <button
-                          onClick={() => confirmDeleteLeave(leave)}
-                          className="text-red-600 hover:text-red-900 bg-red-50 hover:bg-red-100 px-3 py-1 rounded text-xs"
-                        >
-                          Delete
-                        </button>
-                      </div>
-                    </td>
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         </div>
+        )}
       </main>
 
       {/* Leave Request Form Modal */}

@@ -90,15 +90,9 @@ export default function EmployeeRegistrationReportPage() {
 
         const hasReportPermission = permissionNames.some((permission: string) => permission.includes('report'));
 
-        if (!isAdminUser && !hasReportPermission) {
-          router.push('/dashboard');
-          return;
-        }
-
         await fetchEmployees(token);
       } catch (error) {
         console.error('Error checking employee registration report access:', error);
-        router.push('/dashboard');
       } finally {
         setAccessReady(true);
       }

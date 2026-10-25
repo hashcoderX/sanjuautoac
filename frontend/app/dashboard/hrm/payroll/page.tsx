@@ -78,8 +78,13 @@ interface Branch {
   currency?: string;
 }
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
 export default function Payroll() {
   const [token, setToken] = useState('');
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [payrolls, setPayrolls] = useState<Payroll[]>([]);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [branches, setBranches] = useState<Branch[]>([]);
@@ -89,6 +94,10 @@ export default function Payroll() {
   const [selectedPayroll, setSelectedPayroll] = useState<Payroll | null>(null);
   const router = useRouter();
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+
+  const isColumnVisible = (key: string) => !hiddenModules.includes(key);
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
 
   // Generate payroll form fields
   const [selectedBranch, setSelectedBranch] = useState('');
@@ -114,11 +123,109 @@ export default function Payroll() {
   const [noticeType, setNoticeType] = useState<'success' | 'error' | 'warning' | 'info'>('info');
 
   useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchAccessProfile = async (authToken: string) => {
+    try {
+      const [userRes, visibilityRes] = await Promise.all([
+        axios.get(`${API_URL}/api/user`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+      ]);
+
+      const superAdmin = isSuperAdminUser(userRes.data || {});
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching payroll page visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handlePayrollVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating payroll widget visibility:', error);
+      showNotice('Update Failed', 'Unable to update widget visibility. Please try again.', 'error');
+    }
+  };
+
+  useEffect(() => {
     const storedToken = localStorage.getItem('token');
     if (!storedToken) {
       router.push('/');
     } else {
       setToken(storedToken);
+      fetchAccessProfile(storedToken);
       fetchPayrolls(storedToken);
       fetchEmployees(storedToken);
       fetchBranches(storedToken);
@@ -424,47 +531,158 @@ export default function Payroll() {
       <div className="relative z-10 bg-white/80 backdrop-blur-xl shadow-lg border-b border-white/50">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
           <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-6">
-            <div>
-              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-100 text-cyan-700 text-xs font-semibold mb-3">
-                HRM Payroll Center
+            {isElementVisible('hrm-payroll-el-title') && (
+              <div className="relative">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-el-title', true); }}
+                    className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide section"
+                    aria-label="Hide payroll title section"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
+                <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-100 text-cyan-700 text-xs font-semibold mb-3">
+                  HRM Payroll Center
+                </div>
+                <h1 className="text-3xl sm:text-4xl md:text-5xl font-bold text-slate-900 tracking-tight">Payroll Management</h1>
+                <p className="text-sm sm:text-base md:text-lg text-slate-600 mt-2">Accurate salary processing with attendance, overtime, deductions, EPF/ETF, and APIT in one place.</p>
               </div>
-              <h1 className="text-3xl sm:text-4xl md:text-5xl font-bold text-slate-900 tracking-tight">Payroll Management</h1>
-              <p className="text-sm sm:text-base md:text-lg text-slate-600 mt-2">Accurate salary processing with attendance, overtime, deductions, EPF/ETF, and APIT in one place.</p>
-            </div>
-            <div className="md:flex-shrink-0">
-              <button
-                onClick={() => setShowGenerateModal(true)}
-                className="w-full md:w-auto bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-700 hover:to-blue-700 text-white px-7 py-3 rounded-xl font-semibold transition-all duration-300 transform hover:scale-[1.02] shadow-xl"
-              >
-                Generate Payroll
-              </button>
-            </div>
+            )}
+            {isElementVisible('hrm-payroll-el-btn-generate') && (
+              <div className="relative md:flex-shrink-0">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-el-btn-generate', true); }}
+                    className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide button"
+                    aria-label="Hide generate payroll button"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
+                <button
+                  onClick={() => setShowGenerateModal(true)}
+                  className="w-full md:w-auto bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-700 hover:to-blue-700 text-white px-7 py-3 rounded-xl font-semibold transition-all duration-300 transform hover:scale-[1.02] shadow-xl"
+                >
+                  Generate Payroll
+                </button>
+              </div>
+            )}
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mt-7">
-            <div className="rounded-2xl border border-cyan-100 bg-white/80 p-4 shadow-sm">
-              <p className="text-xs font-semibold text-cyan-700 uppercase tracking-wide">Payroll Rows</p>
-              <p className="mt-2 text-2xl font-bold text-slate-900">{filteredPayrolls.length}</p>
-            </div>
-            <div className="rounded-2xl border border-emerald-100 bg-white/80 p-4 shadow-sm">
-              <p className="text-xs font-semibold text-emerald-700 uppercase tracking-wide">Total Net Salary</p>
-              <p className="mt-2 text-2xl font-bold text-slate-900">{formatCurrency(totalNetPayroll, activeCurrency)}</p>
-            </div>
-            <div className="rounded-2xl border border-amber-100 bg-white/80 p-4 shadow-sm">
-              <p className="text-xs font-semibold text-amber-700 uppercase tracking-wide">Pending</p>
-              <p className="mt-2 text-2xl font-bold text-slate-900">{pendingCount}</p>
-            </div>
-            <div className="rounded-2xl border border-violet-100 bg-white/80 p-4 shadow-sm">
-              <p className="text-xs font-semibold text-violet-700 uppercase tracking-wide">Processed / Paid</p>
-              <p className="mt-2 text-2xl font-bold text-slate-900">{processedCount} / {paidCount}</p>
-            </div>
+            {isElementVisible('hrm-payroll-el-stat-rows') && (
+              <div className="relative rounded-2xl border border-cyan-100 bg-white/80 p-4 shadow-sm">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-el-stat-rows', true); }}
+                    className="absolute top-2 right-2 z-20 flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide stat"
+                    aria-label="Hide payroll rows stat"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
+                <p className="text-xs font-semibold text-cyan-700 uppercase tracking-wide">Payroll Rows</p>
+                <p className="mt-2 text-2xl font-bold text-slate-900">{filteredPayrolls.length}</p>
+              </div>
+            )}
+            {isElementVisible('hrm-payroll-el-stat-net') && (
+              <div className="relative rounded-2xl border border-emerald-100 bg-white/80 p-4 shadow-sm">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-el-stat-net', true); }}
+                    className="absolute top-2 right-2 z-20 flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide stat"
+                    aria-label="Hide total net salary stat"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
+                <p className="text-xs font-semibold text-emerald-700 uppercase tracking-wide">Total Net Salary</p>
+                <p className="mt-2 text-2xl font-bold text-slate-900">{formatCurrency(totalNetPayroll, activeCurrency)}</p>
+              </div>
+            )}
+            {isElementVisible('hrm-payroll-el-stat-pending') && (
+              <div className="relative rounded-2xl border border-amber-100 bg-white/80 p-4 shadow-sm">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-el-stat-pending', true); }}
+                    className="absolute top-2 right-2 z-20 flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide stat"
+                    aria-label="Hide pending stat"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
+                <p className="text-xs font-semibold text-amber-700 uppercase tracking-wide">Pending</p>
+                <p className="mt-2 text-2xl font-bold text-slate-900">{pendingCount}</p>
+              </div>
+            )}
+            {isElementVisible('hrm-payroll-el-stat-processed-paid') && (
+              <div className="relative rounded-2xl border border-violet-100 bg-white/80 p-4 shadow-sm">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-el-stat-processed-paid', true); }}
+                    className="absolute top-2 right-2 z-20 flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide stat"
+                    aria-label="Hide processed paid stat"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
+                <p className="text-xs font-semibold text-violet-700 uppercase tracking-wide">Processed / Paid</p>
+                <p className="mt-2 text-2xl font-bold text-slate-900">{processedCount} / {paidCount}</p>
+              </div>
+            )}
           </div>
         </div>
       </div>
 
       {/* Filters */}
       <div className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
-        <div className="bg-white/85 backdrop-blur-sm rounded-2xl shadow-xl border border-white/60 p-6">
+        {isElementVisible('hrm-payroll-sec-filters') && (
+        <div className="relative bg-white/85 backdrop-blur-sm rounded-2xl shadow-xl border border-white/60 p-6">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-sec-filters', true); }}
+              className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide section"
+              aria-label="Hide filters section"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
           <div className="mb-4 flex items-center justify-between">
             <h3 className="text-lg font-bold text-slate-900">Filter & Recalculate</h3>
             <span className="text-xs px-2.5 py-1 rounded-full bg-slate-100 text-slate-600">Smart Controls</span>
@@ -530,11 +748,27 @@ export default function Payroll() {
             </div>
           </div>
         </div>
+        )}
       </div>
 
       {/* Payroll Table */}
       <div className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pb-8">
-        <div className="bg-white/90 backdrop-blur-sm rounded-2xl shadow-xl border border-white/60 overflow-hidden">
+        {isElementVisible('hrm-payroll-sec-table') && (
+        <div className="relative bg-white/90 backdrop-blur-sm rounded-2xl shadow-xl border border-white/60 overflow-hidden">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-sec-table', true); }}
+              className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide section"
+              aria-label="Hide payroll table section"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
           <div className="bg-gradient-to-r from-slate-900 via-cyan-900 to-blue-900 px-6 py-4">
             <h3 className="text-white text-lg font-bold">Payroll Ledger</h3>
             <p className="text-cyan-100 text-sm">Review salary computations, statuses, and employee-wise payouts.</p>
@@ -548,99 +782,259 @@ export default function Payroll() {
               <table className="min-w-full divide-y divide-gray-200">
                 <thead className="bg-slate-50">
                   <tr>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Employee
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Month/Year
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Basic Salary
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Allowances
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Deductions
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Net Salary
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Status
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Actions
-                    </th>
+                    {isColumnVisible('hrm-payroll-col-employee') && (
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        <div className="flex items-center gap-2">
+                          <span>Employee</span>
+                          {showWidgetCloseButtons && (
+                            <button
+                              type="button"
+                              onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-col-employee', true); }}
+                              className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                              title="Hide Employee column"
+                              aria-label="Hide Employee column"
+                            >
+                              <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M18 6 6 18" />
+                                <path d="m6 6 12 12" />
+                              </svg>
+                            </button>
+                          )}
+                        </div>
+                      </th>
+                    )}
+                    {isColumnVisible('hrm-payroll-col-month-year') && (
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        <div className="flex items-center gap-2">
+                          <span>Month/Year</span>
+                          {showWidgetCloseButtons && (
+                            <button
+                              type="button"
+                              onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-col-month-year', true); }}
+                              className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                              title="Hide Month/Year column"
+                              aria-label="Hide Month/Year column"
+                            >
+                              <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M18 6 6 18" />
+                                <path d="m6 6 12 12" />
+                              </svg>
+                            </button>
+                          )}
+                        </div>
+                      </th>
+                    )}
+                    {isColumnVisible('hrm-payroll-col-basic-salary') && (
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        <div className="flex items-center gap-2">
+                          <span>Basic Salary</span>
+                          {showWidgetCloseButtons && (
+                            <button
+                              type="button"
+                              onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-col-basic-salary', true); }}
+                              className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                              title="Hide Basic Salary column"
+                              aria-label="Hide Basic Salary column"
+                            >
+                              <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M18 6 6 18" />
+                                <path d="m6 6 12 12" />
+                              </svg>
+                            </button>
+                          )}
+                        </div>
+                      </th>
+                    )}
+                    {isColumnVisible('hrm-payroll-col-allowances') && (
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        <div className="flex items-center gap-2">
+                          <span>Allowances</span>
+                          {showWidgetCloseButtons && (
+                            <button
+                              type="button"
+                              onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-col-allowances', true); }}
+                              className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                              title="Hide Allowances column"
+                              aria-label="Hide Allowances column"
+                            >
+                              <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M18 6 6 18" />
+                                <path d="m6 6 12 12" />
+                              </svg>
+                            </button>
+                          )}
+                        </div>
+                      </th>
+                    )}
+                    {isColumnVisible('hrm-payroll-col-deductions') && (
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        <div className="flex items-center gap-2">
+                          <span>Deductions</span>
+                          {showWidgetCloseButtons && (
+                            <button
+                              type="button"
+                              onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-col-deductions', true); }}
+                              className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                              title="Hide Deductions column"
+                              aria-label="Hide Deductions column"
+                            >
+                              <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M18 6 6 18" />
+                                <path d="m6 6 12 12" />
+                              </svg>
+                            </button>
+                          )}
+                        </div>
+                      </th>
+                    )}
+                    {isColumnVisible('hrm-payroll-col-net-salary') && (
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        <div className="flex items-center gap-2">
+                          <span>Net Salary</span>
+                          {showWidgetCloseButtons && (
+                            <button
+                              type="button"
+                              onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-col-net-salary', true); }}
+                              className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                              title="Hide Net Salary column"
+                              aria-label="Hide Net Salary column"
+                            >
+                              <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M18 6 6 18" />
+                                <path d="m6 6 12 12" />
+                              </svg>
+                            </button>
+                          )}
+                        </div>
+                      </th>
+                    )}
+                    {isColumnVisible('hrm-payroll-col-status') && (
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        <div className="flex items-center gap-2">
+                          <span>Status</span>
+                          {showWidgetCloseButtons && (
+                            <button
+                              type="button"
+                              onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-col-status', true); }}
+                              className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                              title="Hide Status column"
+                              aria-label="Hide Status column"
+                            >
+                              <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M18 6 6 18" />
+                                <path d="m6 6 12 12" />
+                              </svg>
+                            </button>
+                          )}
+                        </div>
+                      </th>
+                    )}
+                    {isColumnVisible('hrm-payroll-col-actions') && (
+                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        <div className="flex items-center gap-2">
+                          <span>Actions</span>
+                          {showWidgetCloseButtons && (
+                            <button
+                              type="button"
+                              onClick={() => { void handlePayrollVisibilityToggle('hrm-payroll-col-actions', true); }}
+                              className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                              title="Hide Actions column"
+                              aria-label="Hide Actions column"
+                            >
+                              <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M18 6 6 18" />
+                                <path d="m6 6 12 12" />
+                              </svg>
+                            </button>
+                          )}
+                        </div>
+                      </th>
+                    )}
                   </tr>
                 </thead>
                 <tbody className="bg-white divide-y divide-gray-200">
                   {filteredPayrolls.map((payroll) => (
                     <tr key={payroll.id} className="hover:bg-gray-50">
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div className="flex items-center">
-                          <div>
-                            <div className="text-sm font-medium text-gray-900">
-                              {payroll.employee.first_name} {payroll.employee.last_name}
-                            </div>
-                            <div className="text-sm text-gray-500">
-                              {payroll.employee.employee_code}
+                      {isColumnVisible('hrm-payroll-col-employee') && (
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <div className="flex items-center">
+                            <div>
+                              <div className="text-sm font-medium text-gray-900">
+                                {payroll.employee.first_name} {payroll.employee.last_name}
+                              </div>
+                              <div className="text-sm text-gray-500">
+                                {payroll.employee.employee_code}
+                              </div>
                             </div>
                           </div>
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {payroll.month_year}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {formatCurrency(payroll.basic_salary, resolveBranchCurrency(payroll.branch_id) || activeCurrency)}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {formatCurrency(payroll.allowances, resolveBranchCurrency(payroll.branch_id) || activeCurrency)}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {formatCurrency(payroll.deductions, resolveBranchCurrency(payroll.branch_id) || activeCurrency)}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                        {formatCurrency(payroll.net_salary, resolveBranchCurrency(payroll.branch_id) || activeCurrency)}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${getStatusColor(payroll.status)}`}>
-                          {payroll.status.charAt(0).toUpperCase() + payroll.status.slice(1)}
-                        </span>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
-                        <div className="flex space-x-2 items-center">
-                          <button
-                            onClick={() => handleViewPayslip(payroll)}
-                            className="text-blue-700 hover:text-blue-900 bg-blue-50 hover:bg-blue-100 px-3 py-1 rounded-md"
-                          >
-                            View
-                          </button>
-                          <button
-                            onClick={() => handleDownloadPayslip(payroll)}
-                            className="text-emerald-700 hover:text-emerald-900 bg-emerald-50 hover:bg-emerald-100 px-3 py-1 rounded-md"
-                          >
-                            Download
-                          </button>
-                          {payroll.status === 'pending' && (
+                        </td>
+                      )}
+                      {isColumnVisible('hrm-payroll-col-month-year') && (
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                          {payroll.month_year}
+                        </td>
+                      )}
+                      {isColumnVisible('hrm-payroll-col-basic-salary') && (
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                          {formatCurrency(payroll.basic_salary, resolveBranchCurrency(payroll.branch_id) || activeCurrency)}
+                        </td>
+                      )}
+                      {isColumnVisible('hrm-payroll-col-allowances') && (
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                          {formatCurrency(payroll.allowances, resolveBranchCurrency(payroll.branch_id) || activeCurrency)}
+                        </td>
+                      )}
+                      {isColumnVisible('hrm-payroll-col-deductions') && (
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                          {formatCurrency(payroll.deductions, resolveBranchCurrency(payroll.branch_id) || activeCurrency)}
+                        </td>
+                      )}
+                      {isColumnVisible('hrm-payroll-col-net-salary') && (
+                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                          {formatCurrency(payroll.net_salary, resolveBranchCurrency(payroll.branch_id) || activeCurrency)}
+                        </td>
+                      )}
+                      {isColumnVisible('hrm-payroll-col-status') && (
+                        <td className="px-6 py-4 whitespace-nowrap">
+                          <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${getStatusColor(payroll.status)}`}>
+                            {payroll.status.charAt(0).toUpperCase() + payroll.status.slice(1)}
+                          </span>
+                        </td>
+                      )}
+                      {isColumnVisible('hrm-payroll-col-actions') && (
+                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                          <div className="flex space-x-2 items-center">
                             <button
-                              onClick={() => handleStatusUpdate(payroll.id, 'processed')}
-                              className="text-violet-700 hover:text-violet-900 bg-violet-50 hover:bg-violet-100 px-3 py-1 rounded-md"
+                              onClick={() => handleViewPayslip(payroll)}
+                              className="text-blue-700 hover:text-blue-900 bg-blue-50 hover:bg-blue-100 px-3 py-1 rounded-md"
                             >
-                              Process
+                              View
                             </button>
-                          )}
-                          {payroll.status === 'processed' && (
                             <button
-                              onClick={() => handleStatusUpdate(payroll.id, 'paid')}
-                              className="text-teal-700 hover:text-teal-900 bg-teal-50 hover:bg-teal-100 px-3 py-1 rounded-md"
+                              onClick={() => handleDownloadPayslip(payroll)}
+                              className="text-emerald-700 hover:text-emerald-900 bg-emerald-50 hover:bg-emerald-100 px-3 py-1 rounded-md"
                             >
-                              Mark Paid
+                              Download
                             </button>
-                          )}
-                        </div>
-                      </td>
+                            {payroll.status === 'pending' && (
+                              <button
+                                onClick={() => handleStatusUpdate(payroll.id, 'processed')}
+                                className="text-violet-700 hover:text-violet-900 bg-violet-50 hover:bg-violet-100 px-3 py-1 rounded-md"
+                              >
+                                Process
+                              </button>
+                            )}
+                            {payroll.status === 'processed' && (
+                              <button
+                                onClick={() => handleStatusUpdate(payroll.id, 'paid')}
+                                className="text-teal-700 hover:text-teal-900 bg-teal-50 hover:bg-teal-100 px-3 py-1 rounded-md"
+                              >
+                                Mark Paid
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      )}
                     </tr>
                   ))}
                 </tbody>
@@ -653,6 +1047,7 @@ export default function Payroll() {
             </div>
           )}
         </div>
+        )}
       </div>
 
       {/* Generate Payroll Modal */}

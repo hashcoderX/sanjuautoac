@@ -12,26 +12,63 @@ use Illuminate\Validation\ValidationException;
 
 class StockTransferController extends Controller
 {
+    private function tenantContext(Request $request): array
+    {
+        $user = $request->user();
+        $tenantId = (int) $request->input(
+            'tenant_id',
+            $request->attributes->get('tenant_id')
+                ?? $user?->employee?->tenant_id
+                ?? $user?->branch_id
+                ?? 0
+        );
+        $branchId = (int) $request->input(
+            'branch_id',
+            $request->attributes->get('branch_id')
+                ?? $user?->employee?->branch_id
+                ?? $user?->branch_id
+                ?? 0
+        );
+
+        return [$tenantId, $branchId];
+    }
+
     public function index(Request $request): JsonResponse
     {
+        [$tenantId, $branchId] = $this->tenantContext($request);
         $perPage = $request->get('per_page', 15);
 
-        $transfers = StockTransfer::with([
+        $transfersQuery = StockTransfer::with([
             'inventoryItem:id,name,code,unit',
             'outlet:id,name,code',
             'transferredByUser:id,name,email',
-        ])
-            ->orderByDesc('transferred_at')
-            ->paginate($perPage);
+        ]);
 
-        $report = StockTransfer::query()
+        if ($tenantId > 0) {
+            $transfersQuery->where('tenant_id', $tenantId);
+        }
+        if ($branchId > 0) {
+            $transfersQuery->where('branch_id', $branchId);
+        }
+
+        $transfers = $transfersQuery->orderByDesc('transferred_at')->paginate($perPage);
+
+        $reportQuery = StockTransfer::query()
             ->selectRaw('COUNT(*) as total_lines')
             ->selectRaw('COUNT(DISTINCT transfer_reference) as total_invoices')
             ->selectRaw('COUNT(DISTINCT outlet_id) as total_outlets')
             ->selectRaw('COUNT(DISTINCT inventory_item_id) as total_items')
             ->selectRaw('COALESCE(SUM(quantity), 0) as total_quantity')
-            ->selectRaw('MAX(transferred_at) as last_transfer_at')
-            ->first();
+            ->selectRaw('MAX(transferred_at) as last_transfer_at');
+
+        if ($tenantId > 0) {
+            $reportQuery->where('tenant_id', $tenantId);
+        }
+        if ($branchId > 0) {
+            $reportQuery->where('branch_id', $branchId);
+        }
+
+        $report = $reportQuery->first();
 
         return response()->json([
             'success' => true,
@@ -43,6 +80,14 @@ class StockTransferController extends Controller
 
     public function store(Request $request): JsonResponse
     {
+        [$tenantId, $branchId] = $this->tenantContext($request);
+        if ($tenantId <= 0 || $branchId <= 0) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Tenant context is missing.',
+            ], 422);
+        }
+
         $hasMultipleItems = $request->has('items') && is_array($request->items);
 
         $validator = Validator::make($request->all(), $hasMultipleItems ? [
@@ -67,7 +112,7 @@ class StockTransferController extends Controller
         }
 
         try {
-            $createdTransfers = DB::transaction(function () use ($request, $hasMultipleItems) {
+            $createdTransfers = DB::transaction(function () use ($request, $hasMultipleItems, $tenantId, $branchId) {
                 $transferReference = 'TRF' . now()->format('YmdHis') . strtoupper(substr(md5((string) microtime(true)), 0, 4));
                 $lines = $hasMultipleItems
                     ? $request->items
@@ -79,7 +124,11 @@ class StockTransferController extends Controller
                 $result = [];
 
                 foreach ($lines as $index => $line) {
-                    $item = InventoryItem::where('id', $line['inventory_item_id'])->lockForUpdate()->firstOrFail();
+                    $item = InventoryItem::where('id', $line['inventory_item_id'])
+                        ->where('tenant_id', $tenantId)
+                        ->where('branch_id', $branchId)
+                        ->lockForUpdate()
+                        ->firstOrFail();
                     $quantity = (float) $line['quantity'];
                     $currentStock = (float) $item->current_stock;
 
@@ -93,6 +142,8 @@ class StockTransferController extends Controller
                     $item->save();
 
                     $result[] = StockTransfer::create([
+                        'tenant_id' => $tenantId,
+                        'branch_id' => $branchId,
                         'transfer_reference' => $transferReference,
                         'inventory_item_id' => $item->id,
                         'outlet_id' => $request->outlet_id,
@@ -127,6 +178,11 @@ class StockTransferController extends Controller
                 'message' => 'Validation failed',
                 'errors' => $e->errors(),
             ], 422);
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'One or more inventory items are unavailable for your tenant scope.',
+            ], 422);
         } catch (\Exception $e) {
             return response()->json([
                 'success' => false,
@@ -136,16 +192,25 @@ class StockTransferController extends Controller
         }
     }
 
-    public function detailsByReference(string $reference): JsonResponse
+    public function detailsByReference(Request $request, string $reference): JsonResponse
     {
-        $lines = StockTransfer::with([
+        [$tenantId, $branchId] = $this->tenantContext($request);
+
+        $linesQuery = StockTransfer::with([
             'inventoryItem:id,name,code,unit',
             'outlet:id,name,code',
             'transferredByUser:id,name,email',
         ])
-            ->where('transfer_reference', $reference)
-            ->orderBy('id')
-            ->get();
+            ->where('transfer_reference', $reference);
+
+        if ($tenantId > 0) {
+            $linesQuery->where('tenant_id', $tenantId);
+        }
+        if ($branchId > 0) {
+            $linesQuery->where('branch_id', $branchId);
+        }
+
+        $lines = $linesQuery->orderBy('id')->get();
 
         if ($lines->isEmpty()) {
             return response()->json([

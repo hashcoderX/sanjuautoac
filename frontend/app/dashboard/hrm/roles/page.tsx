@@ -36,6 +36,8 @@ interface UserRole {
   role: Role;
 }
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
 
 const PERMISSION_SECTION_ORDER = [
   { key: 'accounts', label: 'Accounts' },
@@ -207,6 +209,9 @@ const inferPermissionSection = (permission: Permission): string => {
 };
 export default function Roles() {
   const [token, setToken] = useState('');
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
   const [roles, setRoles] = useState<Role[]>([]);
   const [permissions, setPermissions] = useState<Permission[]>([]);
@@ -240,6 +245,10 @@ export default function Roles() {
   const [confirmTitle, setConfirmTitle] = useState('');
   const [confirmMessage, setConfirmMessage] = useState('');
   const [confirmAction, setConfirmAction] = useState<(() => Promise<void> | void) | null>(null);
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+
+  const isColumnVisible = (key: string) => !hiddenModules.includes(key);
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -275,11 +284,108 @@ export default function Roles() {
   };
 
   useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchAccessProfile = async (authToken: string) => {
+    try {
+      const [userRes, visibilityRes] = await Promise.all([
+        axios.get(`${API_URL}/api/user`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+      ]);
+
+      const superAdmin = isSuperAdminUser(userRes.data || {});
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching role visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleRoleVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating role widget visibility:', error);
+    }
+  };
+
+  useEffect(() => {
     const storedToken = localStorage.getItem('token');
     if (!storedToken) {
       router.push('/');
     } else {
       setToken(storedToken);
+      fetchAccessProfile(storedToken);
       fetchRoles(storedToken);
       fetchPermissions(storedToken);
       fetchUsers(storedToken);
@@ -347,16 +453,6 @@ export default function Roles() {
 
     return virtualPermissions.filter((permission) => inferPermissionSection(permission) === sectionKey);
   };
-
-  const allPermissionOptions = useMemo(
-    () => permissionSections.flatMap((section) => getSectionPermissionItems(section.key)),
-    [permissionSections, virtualPermissions]
-  );
-
-  const allPermissionsSelected = useMemo(
-    () => allPermissionOptions.length > 0 && allPermissionOptions.every((permission) => selectedPermissions.includes(permission.id)),
-    [allPermissionOptions, selectedPermissions]
-  );
 
   const resolveSelectedPermissionIds = async () => {
     const resolvedIds = selectedPermissions.filter((id) => id > 0);
@@ -495,19 +591,6 @@ export default function Roles() {
     });
   };
 
-  const toggleAllPermissions = () => {
-    const allIds = allPermissionOptions.map((permission) => permission.id);
-    if (allIds.length === 0) return;
-
-    setSelectedPermissions((prev) => {
-      const currentlyAllSelected = allIds.every((id) => prev.includes(id));
-      if (currentlyAllSelected) {
-        return prev.filter((id) => !allIds.includes(id));
-      }
-      return Array.from(new Set([...prev, ...allIds]));
-    });
-  };
-
   const fetchRoles = async (authToken?: string) => {
     const tokenToUse = authToken || token;
     if (!tokenToUse) return;
@@ -619,12 +702,10 @@ export default function Roles() {
     setLoading(true);
     setFormError('');
 
-    const resolvedPermissions = await resolveSelectedPermissionIds();
-
     const roleData = {
       name: roleName,
       description: roleDescription,
-      permissions: resolvedPermissions,
+      permissions: [],
       is_active: isActive,
     };
 
@@ -776,15 +857,33 @@ export default function Roles() {
               </button>
             </div>
             <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-4">
-              <button
-                onClick={() => {
-                  resetForm();
-                  setShowForm(true);
-                }}
-                className="w-full sm:w-auto bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 text-white px-4 py-2 rounded-lg font-medium transition-all duration-300 transform hover:scale-105 shadow-lg hover:shadow-xl"
-              >
-                Add Role
-              </button>
+              {isElementVisible('hrm-roles-el-btn-add') && (
+                <div className="relative">
+                  {showWidgetCloseButtons && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleRoleVisibilityToggle('hrm-roles-el-btn-add', true); }}
+                      className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                      title="Hide button"
+                      aria-label="Hide add role button"
+                    >
+                      <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                    </button>
+                  )}
+                  <button
+                    onClick={() => {
+                      resetForm();
+                      setShowForm(true);
+                    }}
+                    className="w-full sm:w-auto bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 text-white px-4 py-2 rounded-lg font-medium transition-all duration-300 transform hover:scale-105 shadow-lg hover:shadow-xl"
+                  >
+                    Add Role
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -793,20 +892,51 @@ export default function Roles() {
       {/* Main Content */}
       <main className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {/* Header */}
-        <div className="mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-          <div className="flex items-center space-x-3">
-            <div className="w-12 h-12 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-xl flex items-center justify-center text-2xl">
-              🔐
-            </div>
-            <div>
-              <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold text-gray-900">Roles(Designation) & Privileges</h1>
-              <p className="text-sm sm:text-base md:text-lg text-gray-600">Manage user roles and access permissions</p>
+        {isElementVisible('hrm-roles-el-title') && (
+          <div className="relative mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleRoleVisibilityToggle('hrm-roles-el-title', true); }}
+                className="absolute -top-2 -right-2 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                title="Hide section"
+                aria-label="Hide roles title section"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M18 6 6 18" />
+                  <path d="m6 6 12 12" />
+                </svg>
+              </button>
+            )}
+            <div className="flex items-center space-x-3">
+              <div className="w-12 h-12 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-xl flex items-center justify-center text-2xl">
+                🔐
+              </div>
+              <div>
+                <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold text-gray-900">Roles(Designation) & Privileges</h1>
+                <p className="text-sm sm:text-base md:text-lg text-gray-600">Manage user roles and access permissions</p>
+              </div>
             </div>
           </div>
-        </div>
+        )}
 
         {/* Roles Table */}
-        <div className="bg-white/80 backdrop-blur-lg rounded-2xl shadow-xl overflow-hidden">
+        {isElementVisible('hrm-roles-sec-table') && (
+        <div className="relative bg-white/80 backdrop-blur-lg rounded-2xl shadow-xl overflow-hidden">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleRoleVisibilityToggle('hrm-roles-sec-table', true); }}
+              className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide section"
+              aria-label="Hide roles table section"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
           <div className="px-6 py-4 border-b border-gray-200">
             <h2 className="text-xl font-semibold text-gray-900">User Roles</h2>
           </div>
@@ -815,93 +945,194 @@ export default function Roles() {
             <table className="min-w-full divide-y divide-gray-200">
               <thead className="bg-gray-50">
                 <tr>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Role Name
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Description
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Permissions
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Status
-                  </th>
-                  <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
-                    Actions
-                  </th>
+                  {isColumnVisible('hrm-roles-col-name') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Role Name</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleRoleVisibilityToggle('hrm-roles-col-name', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Role Name column"
+                            aria-label="Hide Role Name column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-roles-col-description') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Description</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleRoleVisibilityToggle('hrm-roles-col-description', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Description column"
+                            aria-label="Hide Description column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-roles-col-permissions') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Permissions</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleRoleVisibilityToggle('hrm-roles-col-permissions', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Permissions column"
+                            aria-label="Hide Permissions column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-roles-col-status') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Status</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleRoleVisibilityToggle('hrm-roles-col-status', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Status column"
+                            aria-label="Hide Status column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
+                  {isColumnVisible('hrm-roles-col-actions') && (
+                    <th className="px-6 py-4 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                      <div className="flex items-center gap-2">
+                        <span>Actions</span>
+                        {showWidgetCloseButtons && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleRoleVisibilityToggle('hrm-roles-col-actions', true); }}
+                            className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            title="Hide Actions column"
+                            aria-label="Hide Actions column"
+                          >
+                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M18 6 6 18" />
+                              <path d="m6 6 12 12" />
+                            </svg>
+                          </button>
+                        )}
+                      </div>
+                    </th>
+                  )}
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
                 {roles.map((role) => (
                   <tr key={role.id} className="hover:bg-gray-50 transition-colors duration-200">
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-semibold text-gray-900">
-                      {role.name}
-                    </td>
-                    <td className="px-6 py-4 text-sm text-gray-900 max-w-xs truncate">
-                      {role.description}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-800">
-                        {role.permissions.length} permissions
-                      </span>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <span className={`inline-flex px-3 py-1 text-xs font-semibold rounded-full ${
-                        role.is_active
-                          ? 'bg-green-100 text-green-800'
-                          : 'bg-red-100 text-red-800'
-                      }`}>
-                        {role.is_active ? 'Active' : 'Inactive'}
-                      </span>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
-                      <div className="relative" ref={openMenuFor === role.id ? menuRef : undefined}>
-                        <button
-                          aria-haspopup="menu"
-                          aria-expanded={openMenuFor === role.id}
-                          aria-controls={`row-menu-${role.id}`}
-                          onClick={() => {
-                            const willOpen = openMenuFor !== role.id;
-                            setOpenMenuFor(willOpen ? role.id : null);
-                          }}
-                          className="p-2 rounded-lg text-gray-600 hover:text-gray-900 hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                          title="More actions"
-                        >
-                          <svg className="w-5 h-5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
-                            <path d="M6 10a2 2 0 11-4 0 2 2 0 014 0zm6 0a2 2 0 11-4 0 2 2 0 014 0zm6 0a2 2 0 11-4 0 2 2 0 014 0z" />
-                          </svg>
-                        </button>
-                        {openMenuFor === role.id && (
-                          <div
-                            id={`row-menu-${role.id}`}
-                            role="menu"
-                            tabIndex={-1}
-                            className="absolute right-0 mt-2 w-48 bg-white border border-gray-200 rounded-xl shadow-lg py-1 z-[99]"
+                    {isColumnVisible('hrm-roles-col-name') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm font-semibold text-gray-900">
+                        {role.name}
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-roles-col-description') && (
+                      <td className="px-6 py-4 text-sm text-gray-900 max-w-xs truncate">
+                        {role.description}
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-roles-col-permissions') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-800">
+                          {role.permissions.length} permissions
+                        </span>
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-roles-col-status') && (
+                      <td className="px-6 py-4 whitespace-nowrap">
+                        <span className={`inline-flex px-3 py-1 text-xs font-semibold rounded-full ${
+                          role.is_active
+                            ? 'bg-green-100 text-green-800'
+                            : 'bg-red-100 text-red-800'
+                        }`}>
+                          {role.is_active ? 'Active' : 'Inactive'}
+                        </span>
+                      </td>
+                    )}
+                    {isColumnVisible('hrm-roles-col-actions') && (
+                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                        <div className="relative" ref={openMenuFor === role.id ? menuRef : undefined}>
+                          <button
+                            aria-haspopup="menu"
+                            aria-expanded={openMenuFor === role.id}
+                            aria-controls={`row-menu-${role.id}`}
+                            onClick={() => {
+                              const willOpen = openMenuFor !== role.id;
+                              setOpenMenuFor(willOpen ? role.id : null);
+                            }}
+                            className="p-2 rounded-lg text-gray-600 hover:text-gray-900 hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            title="More actions"
                           >
-                            <button role="menuitem" onClick={() => { openPermissionsModal(role); setOpenMenuFor(null); }} className="w-full flex items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50">
-                              <span className="w-4 h-4">🔑</span>
-                              <span>Manage Permissions</span>
-                            </button>
-                            <button role="menuitem" onClick={() => { handleEdit(role); setOpenMenuFor(null); }} className="w-full flex items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50">
-                              <span className="w-4 h-4">✏️</span>
-                              <span>Edit</span>
-                            </button>
-                            <div className="my-1 h-px bg-gray-200" />
-                            <button role="menuitem" onClick={() => { confirmDeleteRole(role); setOpenMenuFor(null); }} className="w-full flex items-center gap-2 px-3 py-2 text-left text-red-600 hover:bg-red-50">
-                              <span className="w-4 h-4">🗑️</span>
-                              <span>Delete</span>
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    </td>
+                            <svg className="w-5 h-5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                              <path d="M6 10a2 2 0 11-4 0 2 2 0 014 0zm6 0a2 2 0 11-4 0 2 2 0 014 0zm6 0a2 2 0 11-4 0 2 2 0 014 0z" />
+                            </svg>
+                          </button>
+                          {openMenuFor === role.id && (
+                            <div
+                              id={`row-menu-${role.id}`}
+                              role="menu"
+                              tabIndex={-1}
+                              className="absolute right-0 mt-2 w-48 bg-white border border-gray-200 rounded-xl shadow-lg py-1 z-[99]"
+                            >
+                              <button role="menuitem" onClick={() => { openPermissionsModal(role); setOpenMenuFor(null); }} className="w-full flex items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50">
+                                <span className="w-4 h-4">🔑</span>
+                                <span>Manage Permissions</span>
+                              </button>
+                              <button role="menuitem" onClick={() => { handleEdit(role); setOpenMenuFor(null); }} className="w-full flex items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50">
+                                <span className="w-4 h-4">✏️</span>
+                                <span>Edit</span>
+                              </button>
+                              <div className="my-1 h-px bg-gray-200" />
+                              <button role="menuitem" onClick={() => { confirmDeleteRole(role); setOpenMenuFor(null); }} className="w-full flex items-center gap-2 px-3 py-2 text-left text-red-600 hover:bg-red-50">
+                                <span className="w-4 h-4">🗑️</span>
+                                <span>Delete</span>
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         </div>
+        )}
       </main>
 
       {/* Role Form Modal */}
@@ -943,74 +1174,6 @@ export default function Roles() {
                     rows={3}
                     className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all duration-200 text-gray-900 placeholder-gray-500"
                   />
-                </div>
-
-                <div className="md:col-span-2">
-                  <label className="block text-sm font-medium text-gray-700 mb-2 mb-3">
-                    Permissions
-                  </label>
-                  <div className="flex justify-end mb-3">
-                    <button
-                      type="button"
-                      onClick={toggleAllPermissions}
-                      className="px-3 py-1.5 text-xs rounded-md border border-indigo-200 text-indigo-700 hover:bg-indigo-50"
-                    >
-                      {allPermissionsSelected ? 'Clear All' : 'Select All'}
-                    </button>
-                  </div>
-                  <div className="space-y-4 max-h-72 overflow-y-auto border border-gray-200 rounded-xl p-4 bg-gray-50">
-                    {permissionSections.map((section) => {
-                      const sectionItems = getSectionPermissionItems(section.key);
-                      const sectionPermissionIds = sectionItems.map((permission) => permission.id);
-                      const allSelected = sectionPermissionIds.length > 0 && sectionPermissionIds.every((id) => selectedPermissions.includes(id));
-
-                      return (
-                        <div key={section.key} className="rounded-xl border border-gray-200 bg-white p-3">
-                          <div className="flex items-center justify-between mb-2">
-                            <div>
-                              <p className="text-sm font-semibold text-gray-900">{section.label}</p>
-                              <p className="text-xs text-gray-500">{sectionItems.length} permission(s)</p>
-                              {getDisplayActions(section.key).length ? (
-                                <p className="text-[11px] text-gray-500 mt-0.5">
-                                  Actions: {getDisplayActions(section.key).join(', ')}
-                                </p>
-                              ) : null}
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => toggleSectionPermissions(section.key)}
-                              className="px-2.5 py-1 text-xs rounded-md border border-indigo-200 text-indigo-700 hover:bg-indigo-50"
-                            >
-                              {allSelected ? 'Clear' : 'Select All'}
-                            </button>
-                          </div>
-
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                            {sectionItems.map((permission) => (
-                              <label key={permission.id} className="flex items-center space-x-3 p-2 rounded-lg hover:bg-gray-50 transition-colors duration-200">
-                                <input
-                                  type="checkbox"
-                                  checked={selectedPermissions.includes(permission.id)}
-                                  onChange={() => handlePermissionToggle(permission.id)}
-                                  className="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
-                                />
-                                <div className="flex-1 min-w-0">
-                                  <p className="text-sm font-medium text-gray-900">{permission.name || permission.description}</p>
-                                  <p className="text-xs text-gray-600">
-                                    {permission.id < 0 ? 'Will be created when saved' : permission.description}
-                                  </p>
-                                </div>
-                              </label>
-                            ))}
-                          </div>
-                        </div>
-                      );
-                    })}
-
-                    {permissionSections.every((section) => section.permissions.length === 0) && (
-                      <p className="text-sm text-gray-500">No active permissions found.</p>
-                    )}
-                  </div>
                 </div>
 
                 <div className="flex items-center space-x-4">

@@ -62,6 +62,15 @@ class CandidateController extends Controller
             'notes' => 'nullable|string',
         ]);
 
+        $tenantId = (int) $request->input('tenant_id', $request->user()?->employee?->tenant_id ?? $request->user()?->branch_id ?? 0);
+        $branchId = (int) $request->input('branch_id', $request->user()?->employee?->branch_id ?? $request->user()?->branch_id ?? 0);
+
+        if ($tenantId <= 0 || $branchId <= 0) {
+            return response()->json([
+                'message' => 'Unable to resolve tenant and branch for candidate creation.',
+            ], 422);
+        }
+
         // Handle CV file upload
         $cvPath = null;
         if ($request->hasFile('cv_file')) {
@@ -80,8 +89,8 @@ class CandidateController extends Controller
         $candidateCode = 'CAND' . str_pad($nextNumber, 4, '0', STR_PAD_LEFT);
 
         $candidateData = [
-            'tenant_id' => 1, // Default tenant
-            'branch_id' => 1, // Default branch
+            'tenant_id' => $tenantId,
+            'branch_id' => $branchId,
             'candidate_code' => $candidateCode,
             'first_name' => $validated['first_name'],
             'last_name' => $validated['last_name'],
@@ -328,11 +337,13 @@ class CandidateController extends Controller
      */
     public function downloadCv(Candidate $candidate)
     {
-        if (!$candidate->cv_path) {
+        $cvPath = (string) ($candidate->getAttribute('cv_path') ?? '');
+
+        if ($cvPath === '' || !Storage::disk('public')->exists($cvPath)) {
             return response()->json(['message' => 'CV file not found'], 404);
         }
 
-        return Storage::disk('public')->download($candidate->cv_path);
+        return response()->download(Storage::disk('public')->path($cvPath));
     }
 
     /**
@@ -340,10 +351,12 @@ class CandidateController extends Controller
      */
     public function downloadAppointmentLetter(Candidate $candidate)
     {
-        if (!$candidate->appointment_letter_path) {
+        $appointmentLetterPath = (string) ($candidate->getAttribute('appointment_letter_path') ?? '');
+
+        if ($appointmentLetterPath === '' || !Storage::disk('public')->exists($appointmentLetterPath)) {
             return response()->json(['message' => 'Appointment letter not found'], 404);
         }
 
-        return Storage::disk('public')->download($candidate->appointment_letter_path);
+        return response()->download(Storage::disk('public')->path($appointmentLetterPath));
     }
 }

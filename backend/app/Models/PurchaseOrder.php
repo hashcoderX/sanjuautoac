@@ -6,6 +6,7 @@ use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Support\Facades\Schema;
 
 /**
  * @property-read Collection<int, PurchaseOrderItem> $items
@@ -13,6 +14,8 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 class PurchaseOrder extends Model
 {
     protected $fillable = [
+        'tenant_id',
+        'branch_id',
         'order_number',
         'supplier_id',
         'order_date',
@@ -34,20 +37,25 @@ class PurchaseOrder extends Model
 
         static::creating(function ($purchaseOrder) {
             if (empty($purchaseOrder->order_number)) {
-                $purchaseOrder->order_number = static::generateOrderNumber();
+                $purchaseOrder->order_number = static::generateOrderNumber((int) ($purchaseOrder->tenant_id ?? 0));
             }
         });
     }
 
-    public static function generateOrderNumber(): string
+    public static function generateOrderNumber(int $tenantId = 0): string
     {
         $year = date('Y');
         $prefix = 'PO' . $year;
 
+        $query = static::query();
+        if ($tenantId > 0 && Schema::hasColumn('purchase_orders', 'tenant_id')) {
+            $query->where('tenant_id', $tenantId);
+        }
+
         // Get the last order number for this year
-        $lastOrder = static::where('order_number', 'like', $prefix . '%')
-                          ->orderBy('order_number', 'desc')
-                          ->first();
+        $lastOrder = $query->where('order_number', 'like', $prefix . '%')
+            ->orderBy('order_number', 'desc')
+            ->first();
 
         if ($lastOrder) {
             // Extract the sequential number from the last order number

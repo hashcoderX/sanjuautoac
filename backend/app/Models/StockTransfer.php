@@ -8,6 +8,8 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 class StockTransfer extends Model
 {
     protected $fillable = [
+        'tenant_id',
+        'branch_id',
         'transfer_reference',
         'inventory_item_id',
         'outlet_id',

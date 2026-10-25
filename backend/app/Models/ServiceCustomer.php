@@ -8,6 +8,8 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 class ServiceCustomer extends Model
 {
     protected $fillable = [
+        'tenant_id',
+        'branch_id',
         'name',
         'phone',
         'email',

@@ -7,15 +7,57 @@ use App\Models\InventoryItem;
 use App\Models\PurchaseOrder;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Validation\Rule;
 
 class PurchaseOrderController extends Controller
 {
+    private function tenantContext(Request $request): array
+    {
+        $user = $request->user();
+        $tenantId = (int) $request->input(
+            'tenant_id',
+            $request->attributes->get('tenant_id')
+                ?? $user?->employee?->tenant_id
+                ?? $user?->branch_id
+                ?? 0
+        );
+        $branchId = (int) $request->input(
+            'branch_id',
+            $request->attributes->get('branch_id')
+                ?? $user?->employee?->branch_id
+                ?? $user?->branch_id
+                ?? 0
+        );
+
+        return [$tenantId, $branchId];
+    }
+
+    private function ensureTenantOwnership(Request $request, PurchaseOrder $purchaseOrder): ?JsonResponse
+    {
+        [$tenantId, $branchId] = $this->tenantContext($request);
+
+        if (($tenantId > 0 && (int) $purchaseOrder->tenant_id !== $tenantId)
+            || ($branchId > 0 && (int) $purchaseOrder->branch_id !== $branchId)) {
+            return response()->json(['message' => 'Unauthorized purchase order access.'], 403);
+        }
+
+        return null;
+    }
+
     /**
      * Display a listing of the resource.
      */
     public function index(Request $request): JsonResponse
     {
+        [$tenantId, $branchId] = $this->tenantContext($request);
         $query = PurchaseOrder::with(['supplier', 'items.inventoryItem']);
+
+        if ($tenantId > 0) {
+            $query->where('tenant_id', $tenantId);
+        }
+        if ($branchId > 0) {
+            $query->where('branch_id', $branchId);
+        }
 
         $purchaseOrders = $query->get();
 
@@ -27,13 +69,28 @@ class PurchaseOrderController extends Controller
      */
     public function store(Request $request): JsonResponse
     {
+        [$tenantId, $branchId] = $this->tenantContext($request);
+        if ($tenantId <= 0 || $branchId <= 0) {
+            return response()->json(['message' => 'Tenant context is missing.'], 422);
+        }
+
         $validated = $request->validate([
-            'supplier_id' => 'required|exists:suppliers,id',
+            'supplier_id' => [
+                'required',
+                Rule::exists('suppliers', 'id')->where(function ($query) use ($tenantId, $branchId) {
+                    return $query->where('tenant_id', $tenantId)->where('branch_id', $branchId);
+                }),
+            ],
             'order_date' => 'required|date',
             'expected_delivery_date' => 'nullable|date',
             'notes' => 'nullable|string',
             'items' => 'required|array',
-            'items.*.inventory_item_id' => 'nullable|exists:inventory_items,id',
+            'items.*.inventory_item_id' => [
+                'nullable',
+                Rule::exists('inventory_items', 'id')->where(function ($query) use ($tenantId, $branchId) {
+                    return $query->where('tenant_id', $tenantId)->where('branch_id', $branchId);
+                }),
+            ],
             'items.*.item_name' => 'nullable|string|max:255',
             'items.*.item_code' => 'nullable|string|max:100',
             'items.*.item_unit' => 'nullable|string|max:50',
@@ -64,14 +121,22 @@ class PurchaseOrderController extends Controller
         }
 
         $resolvedItems = [];
-        $supplierName = optional(\App\Models\Supplier::find($validated['supplier_id']))->name;
+        $supplierName = optional(
+            \App\Models\Supplier::query()
+                ->where('tenant_id', $tenantId)
+                ->where('branch_id', $branchId)
+                ->find($validated['supplier_id'])
+        )->name;
 
         $totalAmount = 0;
         foreach ($validated['items'] as $item) {
             $inventoryItemId = $item['inventory_item_id'] ?? null;
 
             if ($inventoryItemId) {
-                $inventoryItem = InventoryItem::findOrFail($inventoryItemId);
+                $inventoryItem = InventoryItem::query()
+                    ->where('tenant_id', $tenantId)
+                    ->where('branch_id', $branchId)
+                    ->findOrFail($inventoryItemId);
             } else {
                 $typedName = trim((string) ($item['item_name'] ?? ''));
                 $typedCode = strtoupper(trim((string) ($item['item_code'] ?? '')));
@@ -84,11 +149,16 @@ class PurchaseOrderController extends Controller
 
                 $inventoryItem = null;
                 if (!empty($typedCode)) {
-                    $inventoryItem = InventoryItem::where('code', $typedCode)->first();
+                    $inventoryItem = InventoryItem::where('tenant_id', $tenantId)
+                        ->where('branch_id', $branchId)
+                        ->where('code', $typedCode)
+                        ->first();
                 }
 
                 if (!$inventoryItem) {
-                    $inventoryItem = InventoryItem::where('name', $typedName)
+                    $inventoryItem = InventoryItem::where('tenant_id', $tenantId)
+                        ->where('branch_id', $branchId)
+                        ->where('name', $typedName)
                         ->where('type', $itemType)
                         ->first();
                 }
@@ -102,10 +172,10 @@ class PurchaseOrderController extends Controller
                         }
                     }
 
-                    if (InventoryItem::where('code', $newCode)->exists()) {
+                    if (InventoryItem::where('tenant_id', $tenantId)->where('code', $newCode)->exists()) {
                         $suffix = 1;
                         $baseCode = $newCode;
-                        while (InventoryItem::where('code', $newCode)->exists()) {
+                        while (InventoryItem::where('tenant_id', $tenantId)->where('code', $newCode)->exists()) {
                             $newCode = $baseCode . '-' . $suffix;
                             $suffix++;
                         }
@@ -125,6 +195,8 @@ class PurchaseOrderController extends Controller
                     ], static fn ($value) => $value !== null && $value !== '');
 
                     $inventoryItem = InventoryItem::create([
+                        'tenant_id' => $tenantId,
+                        'branch_id' => $branchId,
                         'name' => $typedName,
                         'code' => $newCode,
                         'description' => 'Auto-created from direct GRN entry.',
@@ -184,6 +256,8 @@ class PurchaseOrderController extends Controller
         }
 
         $purchaseOrder = PurchaseOrder::create([
+            'tenant_id' => $tenantId,
+            'branch_id' => $branchId,
             'supplier_id' => $validated['supplier_id'],
             'order_date' => $validated['order_date'],
             'expected_delivery_date' => $validated['expected_delivery_date'],
@@ -207,8 +281,12 @@ class PurchaseOrderController extends Controller
     /**
      * Display the specified resource.
      */
-    public function show(PurchaseOrder $purchaseOrder): JsonResponse
+    public function show(Request $request, PurchaseOrder $purchaseOrder): JsonResponse
     {
+        if ($response = $this->ensureTenantOwnership($request, $purchaseOrder)) {
+            return $response;
+        }
+
         return response()->json($purchaseOrder->load(['supplier', 'items.inventoryItem']));
     }
 
@@ -217,8 +295,19 @@ class PurchaseOrderController extends Controller
      */
     public function update(Request $request, PurchaseOrder $purchaseOrder): JsonResponse
     {
+        if ($response = $this->ensureTenantOwnership($request, $purchaseOrder)) {
+            return $response;
+        }
+
+        [$tenantId, $branchId] = $this->tenantContext($request);
         $validated = $request->validate([
-            'supplier_id' => 'sometimes|required|exists:suppliers,id',
+            'supplier_id' => [
+                'sometimes',
+                'required',
+                Rule::exists('suppliers', 'id')->where(function ($query) use ($tenantId, $branchId) {
+                    return $query->where('tenant_id', $tenantId)->where('branch_id', $branchId);
+                }),
+            ],
             'order_date' => 'sometimes|required|date',
             'expected_delivery_date' => 'nullable|date',
             'status' => 'sometimes|required|in:pending,approved,received,cancelled',
@@ -233,8 +322,12 @@ class PurchaseOrderController extends Controller
     /**
      * Remove the specified resource from storage.
      */
-    public function destroy(PurchaseOrder $purchaseOrder): JsonResponse
+    public function destroy(Request $request, PurchaseOrder $purchaseOrder): JsonResponse
     {
+        if ($response = $this->ensureTenantOwnership($request, $purchaseOrder)) {
+            return $response;
+        }
+
         $purchaseOrder->delete();
 
         return response()->json(['message' => 'Purchase order deleted successfully']);

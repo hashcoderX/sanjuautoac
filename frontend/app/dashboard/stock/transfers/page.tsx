@@ -4,6 +4,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import axios from 'axios';
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
 interface InventoryItem {
   id: number;
   name: string;
@@ -63,6 +65,9 @@ interface TransferDetails {
 
 export default function StockTransfersPage() {
   const [token, setToken] = useState('');
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [items, setItems] = useState<InventoryItem[]>([]);
@@ -99,14 +104,114 @@ export default function StockTransfersPage() {
   const router = useRouter();
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
 
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+  const isColumnVisible = (key: string) => !hiddenModules.includes(key);
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchAccessProfile = async (authToken: string) => {
+    try {
+      const [userRes, visibilityRes] = await Promise.all([
+        axios.get(`${API_URL}/api/user`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+      ]);
+
+      const superAdmin = isSuperAdminUser(userRes.data || {});
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching stock transfers visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleTransferVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating stock transfers widget visibility:', error);
+    }
+  };
+
   useEffect(() => {
     const storedToken = localStorage.getItem('token');
     if (!storedToken) {
       router.push('/');
     } else {
       setToken(storedToken);
+      fetchAccessProfile(storedToken);
     }
   }, [router]);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
 
   useEffect(() => {
     if (token) {
@@ -123,7 +228,7 @@ export default function StockTransfersPage() {
           headers: { Authorization: `Bearer ${token}` },
           params: { per_page: 1000 }
         }),
-        axios.get(`${API_URL}/api/outlets`, {
+        axios.get(`${API_URL}/api/outlet-pos/outlets`, {
           headers: { Authorization: `Bearer ${token}` },
           params: { per_page: 1000 }
         }),
@@ -273,6 +378,29 @@ export default function StockTransfersPage() {
   };
 
   const invoiceTotal = transferLines.reduce((sum, line) => sum + line.sub_amount, 0);
+  const visibleInvoiceLineColumns = Math.max(
+    [
+      'stock-transfers-col-line-item',
+      'stock-transfers-col-line-code',
+      'stock-transfers-col-line-qty',
+      'stock-transfers-col-line-unit-price',
+      'stock-transfers-col-line-sub-amount',
+      'stock-transfers-col-line-action',
+    ].filter((key) => isColumnVisible(key)).length,
+    1
+  );
+  const visibleRecentColumns = Math.max(
+    [
+      'stock-transfers-col-recent-ref',
+      'stock-transfers-col-recent-date',
+      'stock-transfers-col-recent-item',
+      'stock-transfers-col-recent-outlet',
+      'stock-transfers-col-recent-qty',
+      'stock-transfers-col-recent-by',
+      'stock-transfers-col-recent-action',
+    ].filter((key) => isColumnVisible(key)).length,
+    1
+  );
 
   const handleTransfer = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -467,7 +595,19 @@ export default function StockTransfersPage() {
       </div>
 
       <div className="relative z-10 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
-        <div className="rounded-2xl border border-white/70 bg-white/85 backdrop-blur-xl shadow-xl">
+        {isElementVisible('stock-transfers-el-hero') && (
+          <div className="relative rounded-2xl border border-white/70 bg-white/85 backdrop-blur-xl shadow-xl">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleTransferVisibilityToggle('stock-transfers-el-hero', true); }}
+              className="absolute right-2 top-2 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+              title="Hide hero"
+              aria-label="Hide hero"
+            >
+              x
+            </button>
+          )}
           <div className="px-5 py-6 sm:px-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
             <div>
               <p className="text-xs tracking-[0.18em] uppercase text-orange-500 font-semibold">Distribution Center</p>
@@ -478,46 +618,142 @@ export default function StockTransfersPage() {
                 Build transfer invoices with quick item search and move inventory from central stock to active outlets.
               </p>
             </div>
-            <button
-              onClick={() => router.push('/dashboard/stock')}
-              className="px-4 py-2 rounded-lg text-sm font-medium text-orange-700 border border-orange-200 bg-orange-50 hover:bg-orange-100"
-            >
-              Back to Stock
-            </button>
+            {isElementVisible('stock-transfers-el-btn-back') && (
+              <div className="relative">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handleTransferVisibilityToggle('stock-transfers-el-btn-back', true); }}
+                    className="absolute -right-2 -top-2 z-20 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                    title="Hide back button"
+                    aria-label="Hide back button"
+                  >
+                    x
+                  </button>
+                )}
+                <button
+                  onClick={() => router.push('/dashboard/stock')}
+                  className="px-4 py-2 rounded-lg text-sm font-medium text-orange-700 border border-orange-200 bg-orange-50 hover:bg-orange-100"
+                >
+                  Back to Stock
+                </button>
+              </div>
+            )}
           </div>
         </div>
+        )}
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
-          <div className="rounded-xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-sm p-4">
+        {isElementVisible('stock-transfers-sec-stats') && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+          {isElementVisible('stock-transfers-el-stat-invoices') && (
+            <div className="relative rounded-xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-sm p-4">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleTransferVisibilityToggle('stock-transfers-el-stat-invoices', true); }}
+                className="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                title="Hide invoices stat"
+                aria-label="Hide invoices stat"
+              >
+                x
+              </button>
+            )}
             <p className="text-xs text-gray-500 uppercase tracking-wide">Invoices</p>
             <p className="text-2xl font-bold text-gray-900">{report.total_invoices}</p>
           </div>
-          <div className="rounded-xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-sm p-4">
+          )}
+          {isElementVisible('stock-transfers-el-stat-transfer-lines') && (
+            <div className="relative rounded-xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-sm p-4">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleTransferVisibilityToggle('stock-transfers-el-stat-transfer-lines', true); }}
+                className="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                title="Hide transfer lines stat"
+                aria-label="Hide transfer lines stat"
+              >
+                x
+              </button>
+            )}
             <p className="text-xs text-gray-500 uppercase tracking-wide">Transfer Lines</p>
             <p className="text-2xl font-bold text-gray-900">{report.total_lines}</p>
           </div>
-          <div className="rounded-xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-sm p-4">
+          )}
+          {isElementVisible('stock-transfers-el-stat-total-quantity') && (
+            <div className="relative rounded-xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-sm p-4">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleTransferVisibilityToggle('stock-transfers-el-stat-total-quantity', true); }}
+                className="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                title="Hide total quantity stat"
+                aria-label="Hide total quantity stat"
+              >
+                x
+              </button>
+            )}
             <p className="text-xs text-gray-500 uppercase tracking-wide">Total Quantity</p>
             <p className="text-2xl font-bold text-gray-900">{report.total_quantity.toFixed(2)}</p>
           </div>
-          <div className="rounded-xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-sm p-4">
+          )}
+          {isElementVisible('stock-transfers-el-stat-outlets') && (
+            <div className="relative rounded-xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-sm p-4">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleTransferVisibilityToggle('stock-transfers-el-stat-outlets', true); }}
+                className="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                title="Hide outlets stat"
+                aria-label="Hide outlets stat"
+              >
+                x
+              </button>
+            )}
             <p className="text-xs text-gray-500 uppercase tracking-wide">Outlets</p>
             <p className="text-2xl font-bold text-gray-900">{report.total_outlets}</p>
           </div>
-          <div className="rounded-xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-sm p-4">
+          )}
+          {isElementVisible('stock-transfers-el-stat-last-transfer') && (
+            <div className="relative rounded-xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-sm p-4">
+            {showWidgetCloseButtons && (
+              <button
+                type="button"
+                onClick={() => { void handleTransferVisibilityToggle('stock-transfers-el-stat-last-transfer', true); }}
+                className="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full border border-red-200 bg-white text-xs font-bold text-red-600 hover:bg-red-50"
+                title="Hide last transfer stat"
+                aria-label="Hide last transfer stat"
+              >
+                x
+              </button>
+            )}
             <p className="text-xs text-gray-500 uppercase tracking-wide">Last Transfer</p>
             <p className="text-sm font-semibold text-gray-900">
               {report.last_transfer_at ? new Date(report.last_transfer_at).toLocaleString() : '-'}
             </p>
           </div>
+          )}
         </div>
+        )}
 
-        <div className="rounded-2xl border border-white/70 bg-white/90 backdrop-blur-xl shadow-xl">
+        {isElementVisible('stock-transfers-sec-new-invoice') && (
+          <div className="relative rounded-2xl border border-white/70 bg-white/90 backdrop-blur-xl shadow-xl">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleTransferVisibilityToggle('stock-transfers-sec-new-invoice', true); }}
+              className="absolute right-2 top-2 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+              title="Hide new transfer section"
+              aria-label="Hide new transfer section"
+            >
+              x
+            </button>
+          )}
           <div className="px-5 py-6 sm:px-6">
-            <h4 className="text-lg font-semibold text-gray-900 mb-4">New Transfer Invoice</h4>
+            {isElementVisible('stock-transfers-el-title-new-invoice') && <h4 className="text-lg font-semibold text-gray-900 mb-4">New Transfer Invoice</h4>}
             <form onSubmit={handleTransfer} className="space-y-5">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div>
+              {isElementVisible('stock-transfers-el-input-item-search') && (
+                <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Inventory Item</label>
                 <div className="relative">
                   <input
@@ -583,8 +819,10 @@ export default function StockTransfersPage() {
                   </p>
                 )}
               </div>
+              )}
 
-              <div>
+              {isElementVisible('stock-transfers-el-select-outlet') && (
+                <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Outlet</label>
                 <select
                   value={outletId}
@@ -600,10 +838,12 @@ export default function StockTransfersPage() {
                   ))}
                 </select>
               </div>
+              )}
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div>
+              {isElementVisible('stock-transfers-el-input-quantity') && (
+                <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Quantity</label>
                 <input
                   type="number"
@@ -621,8 +861,10 @@ export default function StockTransfersPage() {
                   placeholder="Type qty and press Enter"
                 />
               </div>
+              )}
 
-              <div className="md:col-span-2">
+              {isElementVisible('stock-transfers-el-input-notes') && (
+                <div className="md:col-span-2">
                 <label className="block text-sm font-medium text-gray-700 mb-1">Notes</label>
                 <input
                   type="text"
@@ -632,121 +874,144 @@ export default function StockTransfersPage() {
                   placeholder="Optional invoice note"
                 />
               </div>
+              )}
             </div>
 
-            <div className="flex justify-end">
-              <button
-                type="button"
-                onClick={addLineItem}
-                className="px-4 py-2 bg-gradient-to-r from-sky-600 to-blue-600 border border-transparent rounded-lg text-sm font-medium text-white hover:from-sky-700 hover:to-blue-700"
-              >
-                Add Item Line
-              </button>
-            </div>
+            {isElementVisible('stock-transfers-el-btn-add-line') && (
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={addLineItem}
+                  className="px-4 py-2 bg-gradient-to-r from-sky-600 to-blue-600 border border-transparent rounded-lg text-sm font-medium text-white hover:from-sky-700 hover:to-blue-700"
+                >
+                  Add Item Line
+                </button>
+              </div>
+            )}
 
-            <div className="overflow-x-auto border border-gray-200 rounded-xl bg-white">
+            {isElementVisible('stock-transfers-sec-line-items-table') && (
+              <div className="overflow-x-auto border border-gray-200 rounded-xl bg-white">
               <table className="min-w-full divide-y divide-gray-200">
                 <thead className="bg-gradient-to-r from-orange-50 to-amber-50">
                   <tr>
-                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Item</th>
-                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Code</th>
-                    <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 uppercase">Qty</th>
-                    <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 uppercase">Unit Price</th>
-                    <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 uppercase">Sub Amount</th>
-                    <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 uppercase">Action</th>
+                    {isColumnVisible('stock-transfers-col-line-item') && <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Item</th>}
+                    {isColumnVisible('stock-transfers-col-line-code') && <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Code</th>}
+                    {isColumnVisible('stock-transfers-col-line-qty') && <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 uppercase">Qty</th>}
+                    {isColumnVisible('stock-transfers-col-line-unit-price') && <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 uppercase">Unit Price</th>}
+                    {isColumnVisible('stock-transfers-col-line-sub-amount') && <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 uppercase">Sub Amount</th>}
+                    {isColumnVisible('stock-transfers-col-line-action') && <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 uppercase">Action</th>}
                   </tr>
                 </thead>
                 <tbody className="bg-white divide-y divide-gray-100">
                   {transferLines.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="px-4 py-6 text-center text-sm text-gray-500">No line items added.</td>
+                      <td colSpan={visibleInvoiceLineColumns} className="px-4 py-6 text-center text-sm text-gray-500">No line items added.</td>
                     </tr>
                   ) : (
                     transferLines.map((line) => (
                       <tr key={line.inventory_item_id}>
-                        <td className="px-4 py-2 text-sm text-gray-700">{line.item_name}</td>
-                        <td className="px-4 py-2 text-sm text-gray-700">{line.item_code}</td>
-                        <td className="px-4 py-2 text-sm text-gray-700 text-right">{line.quantity.toFixed(2)} {line.unit}</td>
-                        <td className="px-4 py-2 text-sm text-gray-700 text-right">{line.unit_price.toFixed(2)}</td>
-                        <td className="px-4 py-2 text-sm font-medium text-gray-900 text-right">{line.sub_amount.toFixed(2)}</td>
-                        <td className="px-4 py-2 text-right">
-                          <button
-                            type="button"
-                            onClick={() => removeLineItem(line.inventory_item_id)}
-                            className="text-red-600 hover:text-red-800 text-sm"
-                          >
-                            Remove
-                          </button>
-                        </td>
+                        {isColumnVisible('stock-transfers-col-line-item') && <td className="px-4 py-2 text-sm text-gray-700">{line.item_name}</td>}
+                        {isColumnVisible('stock-transfers-col-line-code') && <td className="px-4 py-2 text-sm text-gray-700">{line.item_code}</td>}
+                        {isColumnVisible('stock-transfers-col-line-qty') && <td className="px-4 py-2 text-sm text-gray-700 text-right">{line.quantity.toFixed(2)} {line.unit}</td>}
+                        {isColumnVisible('stock-transfers-col-line-unit-price') && <td className="px-4 py-2 text-sm text-gray-700 text-right">{line.unit_price.toFixed(2)}</td>}
+                        {isColumnVisible('stock-transfers-col-line-sub-amount') && <td className="px-4 py-2 text-sm font-medium text-gray-900 text-right">{line.sub_amount.toFixed(2)}</td>}
+                        {isColumnVisible('stock-transfers-col-line-action') && (
+                          <td className="px-4 py-2 text-right">
+                            <button
+                              type="button"
+                              onClick={() => removeLineItem(line.inventory_item_id)}
+                              className="text-red-600 hover:text-red-800 text-sm"
+                            >
+                              Remove
+                            </button>
+                          </td>
+                        )}
                       </tr>
                     ))
                   )}
                 </tbody>
                 <tfoot className="bg-gradient-to-r from-orange-50 to-amber-50">
                   <tr>
-                    <td colSpan={4} className="px-4 py-2 text-right text-sm font-semibold text-gray-700">Invoice Total</td>
-                    <td className="px-4 py-2 text-right text-sm font-bold text-gray-900">{invoiceTotal.toFixed(2)}</td>
-                    <td></td>
+                    <td colSpan={Math.max(visibleInvoiceLineColumns - 2, 1)} className="px-4 py-2 text-right text-sm font-semibold text-gray-700">Invoice Total</td>
+                    <td className="px-4 py-2 text-right text-sm font-bold text-gray-900" colSpan={Math.min(2, visibleInvoiceLineColumns)}>{invoiceTotal.toFixed(2)}</td>
                   </tr>
                 </tfoot>
               </table>
             </div>
+            )}
 
-            <div className="flex justify-end">
-              <button
-                type="submit"
-                disabled={saving}
-                className="px-5 py-2 bg-gradient-to-r from-orange-500 to-amber-500 border border-transparent rounded-lg text-sm font-medium text-white hover:from-orange-600 hover:to-amber-600 disabled:opacity-50"
-              >
-                {saving ? 'Transferring...' : 'Submit Transfer Invoice'}
-              </button>
-            </div>
+            {isElementVisible('stock-transfers-el-btn-submit-invoice') && (
+              <div className="flex justify-end">
+                <button
+                  type="submit"
+                  disabled={saving}
+                  className="px-5 py-2 bg-gradient-to-r from-orange-500 to-amber-500 border border-transparent rounded-lg text-sm font-medium text-white hover:from-orange-600 hover:to-amber-600 disabled:opacity-50"
+                >
+                  {saving ? 'Transferring...' : 'Submit Transfer Invoice'}
+                </button>
+              </div>
+            )}
           </form>
           </div>
         </div>
+        )}
 
-        <div className="rounded-2xl border border-white/70 bg-white/90 backdrop-blur-xl shadow-xl">
+        {isElementVisible('stock-transfers-sec-recent-transfers') && (
+          <div className="relative rounded-2xl border border-white/70 bg-white/90 backdrop-blur-xl shadow-xl">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleTransferVisibilityToggle('stock-transfers-sec-recent-transfers', true); }}
+              className="absolute right-2 top-2 z-20 inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-200 bg-white text-sm font-bold text-red-600 hover:bg-red-50"
+              title="Hide recent transfers section"
+              aria-label="Hide recent transfers section"
+            >
+              x
+            </button>
+          )}
           <div className="px-5 py-6 sm:px-6">
           <div className="flex items-center justify-between mb-4">
-            <h4 className="text-lg font-semibold text-gray-900">Recent Transfers</h4>
-            <p className="text-sm text-gray-500">Total Records: {totalTransfers}</p>
+            {isElementVisible('stock-transfers-el-title-recent-transfers') && <h4 className="text-lg font-semibold text-gray-900">Recent Transfers</h4>}
+            {isElementVisible('stock-transfers-el-total-records') && <p className="text-sm text-gray-500">Total Records: {totalTransfers}</p>}
           </div>
           <div className="overflow-x-auto rounded-xl border border-gray-200">
             <table className="min-w-full divide-y divide-gray-200">
               <thead className="bg-gradient-to-r from-orange-50 to-amber-50">
                 <tr>
-                  <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Ref</th>
-                  <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Date</th>
-                  <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Item</th>
-                  <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Outlet</th>
-                  <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Qty</th>
-                  <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">By</th>
-                  <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Action</th>
+                  {isColumnVisible('stock-transfers-col-recent-ref') && <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Ref</th>}
+                  {isColumnVisible('stock-transfers-col-recent-date') && <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Date</th>}
+                  {isColumnVisible('stock-transfers-col-recent-item') && <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Item</th>}
+                  {isColumnVisible('stock-transfers-col-recent-outlet') && <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Outlet</th>}
+                  {isColumnVisible('stock-transfers-col-recent-qty') && <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Qty</th>}
+                  {isColumnVisible('stock-transfers-col-recent-by') && <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">By</th>}
+                  {isColumnVisible('stock-transfers-col-recent-action') && <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Action</th>}
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-100">
                 {transfers.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="px-4 py-8 text-center text-sm text-gray-500">No transfers recorded yet.</td>
+                    <td colSpan={visibleRecentColumns} className="px-4 py-8 text-center text-sm text-gray-500">No transfers recorded yet.</td>
                   </tr>
                 ) : (
                   transfers.map((transfer) => (
                     <tr key={transfer.id}>
-                      <td className="px-4 py-2 text-sm text-gray-700">{transfer.transfer_reference || '-'}</td>
-                      <td className="px-4 py-2 text-sm text-gray-700">{new Date(transfer.transferred_at).toLocaleString()}</td>
-                      <td className="px-4 py-2 text-sm text-gray-700">{transfer.inventory_item?.name} ({transfer.inventory_item?.code})</td>
-                      <td className="px-4 py-2 text-sm text-gray-700">{transfer.outlet?.name} ({transfer.outlet?.code})</td>
-                      <td className="px-4 py-2 text-sm text-gray-700">{Number(transfer.quantity).toFixed(2)} {transfer.inventory_item?.unit}</td>
-                      <td className="px-4 py-2 text-sm text-gray-700">{transfer.transferred_by_user?.name || '-'}</td>
-                      <td className="px-4 py-2 text-sm text-gray-700">
-                        <button
-                          type="button"
-                          onClick={() => handleViewDetails(transfer)}
-                          className="px-3 py-1 bg-gradient-to-r from-orange-500 to-amber-500 text-white rounded-md text-xs hover:from-orange-600 hover:to-amber-600"
-                        >
-                          View Details
-                        </button>
-                      </td>
+                      {isColumnVisible('stock-transfers-col-recent-ref') && <td className="px-4 py-2 text-sm text-gray-700">{transfer.transfer_reference || '-'}</td>}
+                      {isColumnVisible('stock-transfers-col-recent-date') && <td className="px-4 py-2 text-sm text-gray-700">{new Date(transfer.transferred_at).toLocaleString()}</td>}
+                      {isColumnVisible('stock-transfers-col-recent-item') && <td className="px-4 py-2 text-sm text-gray-700">{transfer.inventory_item?.name} ({transfer.inventory_item?.code})</td>}
+                      {isColumnVisible('stock-transfers-col-recent-outlet') && <td className="px-4 py-2 text-sm text-gray-700">{transfer.outlet?.name} ({transfer.outlet?.code})</td>}
+                      {isColumnVisible('stock-transfers-col-recent-qty') && <td className="px-4 py-2 text-sm text-gray-700">{Number(transfer.quantity).toFixed(2)} {transfer.inventory_item?.unit}</td>}
+                      {isColumnVisible('stock-transfers-col-recent-by') && <td className="px-4 py-2 text-sm text-gray-700">{transfer.transferred_by_user?.name || '-'}</td>}
+                      {isColumnVisible('stock-transfers-col-recent-action') && (
+                        <td className="px-4 py-2 text-sm text-gray-700">
+                          <button
+                            type="button"
+                            onClick={() => handleViewDetails(transfer)}
+                            className="px-3 py-1 bg-gradient-to-r from-orange-500 to-amber-500 text-white rounded-md text-xs hover:from-orange-600 hover:to-amber-600"
+                          >
+                            View Details
+                          </button>
+                        </td>
+                      )}
                     </tr>
                   ))
                 )}
@@ -754,27 +1019,30 @@ export default function StockTransfersPage() {
             </table>
           </div>
 
-          <div className="mt-4 flex items-center justify-between">
-            <button
-              type="button"
-              onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
-              disabled={currentPage === 1}
-              className="px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-            >
-              Previous
-            </button>
-            <span className="text-sm text-gray-600">Page {currentPage} of {lastPage}</span>
-            <button
-              type="button"
-              onClick={() => setCurrentPage((prev) => Math.min(lastPage, prev + 1))}
-              disabled={currentPage === lastPage}
-              className="px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-            >
-              Next
-            </button>
-          </div>
+          {isElementVisible('stock-transfers-sec-pagination') && (
+            <div className="mt-4 flex items-center justify-between">
+              <button
+                type="button"
+                onClick={() => setCurrentPage((prev) => Math.max(1, prev - 1))}
+                disabled={currentPage === 1}
+                className="px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              >
+                Previous
+              </button>
+              <span className="text-sm text-gray-600">Page {currentPage} of {lastPage}</span>
+              <button
+                type="button"
+                onClick={() => setCurrentPage((prev) => Math.min(lastPage, prev + 1))}
+                disabled={currentPage === lastPage}
+                className="px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              >
+                Next
+              </button>
+            </div>
+          )}
           </div>
         </div>
+        )}
 
         {showDetailsModal && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">

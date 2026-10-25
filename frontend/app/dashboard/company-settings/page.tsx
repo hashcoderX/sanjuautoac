@@ -34,11 +34,16 @@ interface AccountRow {
 
 const PROFILE_ID_KEY = 'company_profile_id';
 const PROFILE_DATA_KEY = 'company_profile_data';
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
 
 export default function CompanySettingsPage() {
   const [token, setToken] = useState('');
   const [accessReady, setAccessReady] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [isSuperAdmin, setIsSuperAdmin] = useState(false);
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
 
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -56,6 +61,11 @@ export default function CompanySettingsPage() {
   const [showMessageModal, setShowMessageModal] = useState(false);
   const [messageModalTitle, setMessageModalTitle] = useState('');
   const [messageModalBody, setMessageModalBody] = useState('');
+  const [showFixAuthModal, setShowFixAuthModal] = useState(false);
+  const [fixAuthEmail, setFixAuthEmail] = useState('');
+  const [fixAuthPassword, setFixAuthPassword] = useState('');
+  const [fixAuthError, setFixAuthError] = useState('');
+  const [fixAuthLoading, setFixAuthLoading] = useState(false);
 
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -79,6 +89,94 @@ export default function CompanySettingsPage() {
   const router = useRouter();
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
   const API_BASE = API_URL;
+  const canManageWidgetControls = isSuperAdmin && canManageFeatureVisibility;
+  const showWidgetCloseButtons = canManageWidgetControls && !widgetsFixed;
+  const isWidgetVisible = (key: string) => !hiddenModules.includes(key);
+
+  const applyWidgetsFixed = (nextValue: boolean) => {
+    setWidgetsFixed(nextValue);
+    localStorage.setItem(GLOBAL_WIDGET_FIX_KEY, nextValue ? '1' : '0');
+    window.dispatchEvent(new CustomEvent('widgets-fixed-changed', { detail: { fixed: nextValue } }));
+  };
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const openFixAuthModal = () => {
+    setFixAuthEmail('');
+    setFixAuthPassword('');
+    setFixAuthError('');
+    setShowFixAuthModal(true);
+  };
+
+  const closeFixAuthModal = () => {
+    if (fixAuthLoading) return;
+    setShowFixAuthModal(false);
+    setFixAuthEmail('');
+    setFixAuthPassword('');
+    setFixAuthError('');
+  };
+
+  const handleFixWidgetButtonClick = () => {
+    if (!canManageWidgetControls) {
+      return;
+    }
+
+    if (widgetsFixed) {
+      applyWidgetsFixed(false);
+      return;
+    }
+
+    openFixAuthModal();
+  };
+
+  const confirmFixWidgets = async (event: React.FormEvent) => {
+    event.preventDefault();
+
+    if (!token || !canManageWidgetControls || fixAuthLoading) {
+      return;
+    }
+
+    try {
+      setFixAuthLoading(true);
+      setFixAuthError('');
+
+      await axios.post(
+        `${API_URL}/api/feature-visibility/verify-super-admin`,
+        {
+          email: fixAuthEmail.trim(),
+          password: fixAuthPassword,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      applyWidgetsFixed(true);
+      setShowFixAuthModal(false);
+      setFixAuthEmail('');
+      setFixAuthPassword('');
+      setFixAuthError('');
+    } catch (error: any) {
+      const message = error?.response?.data?.message || 'Super Admin credentials are invalid.';
+      setFixAuthError(message);
+    } finally {
+      setFixAuthLoading(false);
+    }
+  };
 
   const normalizeLogoUrl = (company?: CompanyProfile | null): string => {
     if (!company) return '';
@@ -126,6 +224,80 @@ export default function CompanySettingsPage() {
   }, [router]);
 
   useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
+
+  const fetchWidgetVisibility = async (authToken: string) => {
+    try {
+      const visibilityRes = await axios.get(`${API_URL}/api/feature-visibility`, {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setCanManageFeatureVisibility(Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error loading company-settings widget visibility:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleWidgetVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageWidgetControls) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating company-settings widget visibility:', error);
+    }
+  };
+
+  useEffect(() => {
     if (!token) return;
 
     const bootstrap = async () => {
@@ -151,8 +323,10 @@ export default function CompanySettingsPage() {
           roleNames.includes('superadmin') ||
           roleNames.includes('administrator') ||
           roleNames.includes('admin');
+        const superAdminUser = isSuperAdminUser(userData);
 
         setIsAdmin(adminUser);
+        setIsSuperAdmin(superAdminUser);
 
         if (!adminUser) {
           router.push('/dashboard');
@@ -165,6 +339,7 @@ export default function CompanySettingsPage() {
           if (parsed > 0) setActiveProfileId(parsed);
         }
 
+        await fetchWidgetVisibility(token);
         await fetchCompanies(token);
       } catch (error) {
         console.error('Error loading company settings access:', error);
@@ -462,10 +637,6 @@ export default function CompanySettingsPage() {
     );
   }
 
-  if (!isAdmin) {
-    return null;
-  }
-
   return (
     <div className="min-h-screen bg-gradient-to-br from-cyan-50 via-sky-50 to-emerald-50 relative overflow-hidden">
       <div className="absolute inset-0 opacity-40 pointer-events-none">
@@ -488,6 +659,14 @@ export default function CompanySettingsPage() {
               >
                 Back to Dashboard
               </button>
+              {canManageWidgetControls && (
+                <button
+                  onClick={handleFixWidgetButtonClick}
+                  className="px-4 py-2 bg-gradient-to-r from-slate-500 to-gray-600 border border-transparent rounded-md text-sm font-semibold text-white hover:from-slate-600 hover:to-gray-700 shadow-lg shadow-slate-200/50 transition-all"
+                >
+                  {widgetsFixed ? 'Edit Widgets' : 'Fix Widgets'}
+                </button>
+              )}
               <button
                 onClick={openCreate}
                 className="px-4 py-2 bg-gradient-to-r from-emerald-600 to-cyan-600 border border-transparent rounded-md text-sm font-semibold text-white hover:from-emerald-700 hover:to-cyan-700 shadow-lg shadow-emerald-200/50 transition-all"
@@ -500,7 +679,22 @@ export default function CompanySettingsPage() {
       </nav>
 
       <main className="relative z-10 max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-6">
-        <section className="rounded-2xl border border-white/70 bg-white/80 backdrop-blur-lg shadow-xl p-5 md:p-6">
+        {isWidgetVisible('company-settings-sec-identity') && (
+        <section className="relative rounded-2xl border border-white/70 bg-white/80 backdrop-blur-lg shadow-xl p-5 md:p-6">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleWidgetVisibilityToggle('company-settings-sec-identity', true); }}
+              className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide widget"
+              aria-label="Hide widget"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
           <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
             <div>
               <h2 className="text-xl md:text-2xl font-bold text-gray-900">Company Identity Center</h2>
@@ -536,8 +730,24 @@ export default function CompanySettingsPage() {
             </div>
           </div>
         </section>
+        )}
 
-        <section className="rounded-2xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-xl p-5 md:p-6">
+        {isWidgetVisible('company-settings-sec-active-profile') && (
+        <section className="relative rounded-2xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-xl p-5 md:p-6">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleWidgetVisibilityToggle('company-settings-sec-active-profile', true); }}
+              className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide widget"
+              aria-label="Hide widget"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
           <h3 className="text-sm font-semibold text-gray-900 mb-2">Active Document Profile</h3>
           {activeCompany ? (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm text-gray-700">
@@ -567,8 +777,24 @@ export default function CompanySettingsPage() {
             This profile is stored in browser local storage and can be used for invoice headers and printed documents.
           </p>
         </section>
+        )}
 
-        <section className="rounded-2xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-xl p-5 md:p-6">
+        {isWidgetVisible('company-settings-sec-accounting') && (
+        <section className="relative rounded-2xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-xl p-5 md:p-6">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleWidgetVisibilityToggle('company-settings-sec-accounting', true); }}
+              className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide widget"
+              aria-label="Hide widget"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
           <h3 className="text-sm font-semibold text-gray-900 mb-2">Accounting Overview</h3>
           {activeCompany ? (
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm text-gray-700">
@@ -612,8 +838,24 @@ export default function CompanySettingsPage() {
             These accounting balances are saved in the database with each company profile.
           </p>
         </section>
+        )}
 
-        <section className="rounded-2xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-xl overflow-hidden">
+        {isWidgetVisible('company-settings-sec-profiles') && (
+        <section className="relative rounded-2xl border border-white/70 bg-white/85 backdrop-blur-lg shadow-xl overflow-hidden">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleWidgetVisibilityToggle('company-settings-sec-profiles', true); }}
+              className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide widget"
+              aria-label="Hide widget"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
           <div className="px-4 py-3 border-b border-gray-100 bg-gradient-to-r from-white to-cyan-50">
             <h2 className="text-sm font-semibold text-gray-900">Company Profiles</h2>
           </div>
@@ -664,8 +906,24 @@ export default function CompanySettingsPage() {
             </div>
           )}
         </section>
+        )}
 
-        <section className="rounded-2xl border border-red-200 bg-gradient-to-br from-red-50 to-white shadow-xl p-5 md:p-6">
+        {isWidgetVisible('company-settings-sec-danger-zone') && (
+        <section className="relative rounded-2xl border border-red-200 bg-gradient-to-br from-red-50 to-white shadow-xl p-5 md:p-6">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleWidgetVisibilityToggle('company-settings-sec-danger-zone', true); }}
+              className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide widget"
+              aria-label="Hide widget"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
             <div>
               <h3 className="text-base font-semibold text-red-800">Danger Zone</h3>
@@ -692,6 +950,7 @@ export default function CompanySettingsPage() {
             </button>
           </div>
         </section>
+        )}
       </main>
 
       {showForm && (
@@ -878,6 +1137,63 @@ export default function CompanySettingsPage() {
                 <button type="button" onClick={() => setShowForm(false)} className="px-4 py-2 border border-cyan-200 rounded-lg text-sm text-cyan-700 bg-white hover:bg-cyan-50">Cancel</button>
                 <button type="submit" disabled={saving} className="px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-cyan-600 text-white rounded-lg text-sm font-semibold hover:from-emerald-700 hover:to-cyan-700 disabled:opacity-50 shadow-lg shadow-emerald-200/50 transition-all">
                   {saving ? 'Saving...' : editingCompanyId ? 'Update Profile' : 'Create Profile'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showFixAuthModal && (
+        <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/50 p-4">
+          <div className="w-full max-w-md rounded-2xl border border-gray-200 bg-white shadow-2xl overflow-hidden">
+            <div className="px-4 py-3 border-b border-gray-100 bg-gradient-to-r from-slate-50 to-white">
+              <h3 className="text-sm font-semibold text-gray-900">Verify Super Admin to Fix Widgets</h3>
+            </div>
+
+            <form onSubmit={confirmFixWidgets} className="p-4 space-y-3">
+              <p className="text-xs text-gray-600">
+                Enter Super Admin email and password to enable Fix Widgets mode.
+              </p>
+
+              <div>
+                <label className="block text-xs font-semibold text-gray-700 mb-1">Super Admin Email</label>
+                <input
+                  type="email"
+                  value={fixAuthEmail}
+                  onChange={(e) => setFixAuthEmail(e.target.value)}
+                  required
+                  className="w-full rounded-md border border-gray-300 text-sm text-black px-3 py-2 focus:ring-2 focus:ring-slate-500 focus:border-slate-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-gray-700 mb-1">Super Admin Password</label>
+                <input
+                  type="password"
+                  value={fixAuthPassword}
+                  onChange={(e) => setFixAuthPassword(e.target.value)}
+                  required
+                  className="w-full rounded-md border border-gray-300 text-sm text-black px-3 py-2 focus:ring-2 focus:ring-slate-500 focus:border-slate-500"
+                />
+              </div>
+
+              {fixAuthError && <p className="text-xs text-red-700">{fixAuthError}</p>}
+
+              <div className="pt-1 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={closeFixAuthModal}
+                  className="px-3 py-2 rounded-md border border-gray-300 text-sm text-gray-700 hover:bg-gray-100"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={fixAuthLoading}
+                  className="px-3 py-2 rounded-md text-sm font-semibold text-white bg-slate-600 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {fixAuthLoading ? 'Verifying...' : 'Verify & Fix'}
                 </button>
               </div>
             </form>

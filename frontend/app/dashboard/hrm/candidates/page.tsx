@@ -91,9 +91,14 @@ type CandidateFull = Candidate & {
   interviews?: Interview[];
 };
 
+const GLOBAL_WIDGET_FIX_KEY = 'widgets_fixed_global';
+
 export default function Candidates() {
   const [token, setToken] = useState('');
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
+  const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
+  const [widgetsFixed, setWidgetsFixed] = useState(false);
+  const [hiddenModules, setHiddenModules] = useState<string[]>([]);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
   const [designations, setDesignations] = useState<Designation[]>([]);
@@ -181,6 +186,10 @@ export default function Candidates() {
   const [noticeType, setNoticeType] = useState<'success' | 'error' | 'info'>('info');
   const [noticeTitle, setNoticeTitle] = useState<string>('');
   const [noticeMessage, setNoticeMessage] = useState<string>('');
+  const showWidgetCloseButtons = canManageFeatureVisibility && !widgetsFixed;
+
+  const isColumnVisible = (key: string) => !hiddenModules.includes(key);
+  const isElementVisible = (key: string) => !hiddenModules.includes(key);
 
   const showSuccess = (message: string, title = 'Success') => {
     setNoticeType('success');
@@ -193,6 +202,103 @@ export default function Candidates() {
     setNoticeTitle(title);
     setNoticeMessage(message);
     setShowNotice(true);
+  };
+
+  useEffect(() => {
+    const stored = localStorage.getItem(GLOBAL_WIDGET_FIX_KEY);
+    setWidgetsFixed(stored === '1');
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === GLOBAL_WIDGET_FIX_KEY) {
+        setWidgetsFixed(event.newValue === '1');
+      }
+    };
+
+    const handleWidgetFixChanged = (event: Event) => {
+      const customEvent = event as CustomEvent<{ fixed?: boolean }>;
+      setWidgetsFixed(Boolean(customEvent.detail?.fixed));
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('widgets-fixed-changed', handleWidgetFixChanged as EventListener);
+    };
+  }, []);
+
+  const isSuperAdminUser = (userData: any): boolean => {
+    const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
+    const roleNames = [
+      String(userData?.role || ''),
+      ...(Array.isArray(userData?.roles)
+        ? userData.roles.map((role: any) => String(role?.name || role || ''))
+        : []),
+    ]
+      .map((role) => role.trim().toLowerCase())
+      .filter(Boolean);
+
+    const roleBlob = roleNames.join(' ');
+
+    return !employeeId || roleBlob.includes('super admin') || roleBlob.includes('superadmin');
+  };
+
+  const fetchAccessProfile = async (authToken: string) => {
+    try {
+      const [userRes, visibilityRes] = await Promise.all([
+        axios.get(`${API_URL}/api/user`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        axios.get(`${API_URL}/api/feature-visibility`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+      ]);
+
+      const superAdmin = isSuperAdminUser(userRes.data || {});
+      const hiddenModuleList = Array.isArray(visibilityRes.data?.hidden_modules)
+        ? visibilityRes.data.hidden_modules
+            .map((moduleId: unknown) => String(moduleId || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setCanManageFeatureVisibility(superAdmin && Boolean(visibilityRes.data?.can_manage));
+      setHiddenModules(Array.from(new Set(hiddenModuleList)));
+    } catch (error) {
+      console.error('Error fetching candidates page visibility profile:', error);
+      setCanManageFeatureVisibility(false);
+      setHiddenModules([]);
+    }
+  };
+
+  const handleCandidateVisibilityToggle = async (moduleKey: string, hidden: boolean) => {
+    if (!token || !canManageFeatureVisibility) {
+      return;
+    }
+
+    try {
+      const response = await axios.put(
+        `${API_URL}/api/feature-visibility`,
+        {
+          module_key: moduleKey,
+          hidden,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+
+      const nextHiddenModules = Array.isArray(response.data?.hidden_modules)
+        ? response.data.hidden_modules
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : [];
+
+      setHiddenModules(Array.from(new Set(nextHiddenModules)));
+    } catch (error) {
+      console.error('Error updating candidate widget visibility:', error);
+      showError('Unable to update widget visibility. Please try again.', 'Update Failed');
+    }
   };
 
   useEffect(() => {
@@ -219,6 +325,7 @@ export default function Candidates() {
     } else {
       setToken(storedToken);
       setApiError(null);
+      fetchAccessProfile(storedToken);
       fetchCandidates(storedToken);
       fetchDepartments(storedToken);
       fetchDesignations(storedToken);
@@ -856,46 +963,268 @@ export default function Candidates() {
         {/* Hero Section */}
         <div className="mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-6">
           <div>
-            <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold text-gray-900">Candidates</h1>
-            <p className="text-sm sm:text-base md:text-lg text-gray-600">Manage applicants, interviews and conversions</p>
+            {isElementVisible('hrm-candidates-el-title') && (
+              <div className="relative">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handleCandidateVisibilityToggle('hrm-candidates-el-title', true); }}
+                    className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide section"
+                    aria-label="Hide candidate title section"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
+                <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold text-gray-900">Candidates</h1>
+                <p className="text-sm sm:text-base md:text-lg text-gray-600">Manage applicants, interviews and conversions</p>
+              </div>
+            )}
           </div>
           <div className="flex items-center gap-3">
-            <button
-              onClick={() => { resetForm(); resetEditForm(); setShowForm(true); }}
-              className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700"
-            >
-              Add Candidate
-            </button>
-            <button onClick={() => fetchCandidates()} className="px-4 py-2 rounded-lg border">Refresh</button>
+            {isElementVisible('hrm-candidates-el-btn-add') && (
+              <div className="relative">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handleCandidateVisibilityToggle('hrm-candidates-el-btn-add', true); }}
+                    className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide add button"
+                    aria-label="Hide add candidate button"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
+                <button
+                  onClick={() => { resetForm(); resetEditForm(); setShowForm(true); }}
+                  className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700"
+                >
+                  Add Candidate
+                </button>
+              </div>
+            )}
+            {isElementVisible('hrm-candidates-el-btn-refresh') && (
+              <div className="relative">
+                {showWidgetCloseButtons && (
+                  <button
+                    type="button"
+                    onClick={() => { void handleCandidateVisibilityToggle('hrm-candidates-el-btn-refresh', true); }}
+                    className="absolute -top-2 -right-2 z-20 flex h-6 w-6 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                    title="Hide refresh button"
+                    aria-label="Hide refresh button"
+                  >
+                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 6 6 18" />
+                      <path d="m6 6 12 12" />
+                    </svg>
+                  </button>
+                )}
+                <button onClick={() => fetchCandidates()} className="px-4 py-2 rounded-lg border">Refresh</button>
+              </div>
+            )}
           </div>
         </div>
 
         {/* Candidates Table */}
-        <div className="bg-white/80 backdrop-blur rounded-xl shadow-sm border">
+        {isElementVisible('hrm-candidates-sec-table') && (
+        <div className="relative bg-white/80 backdrop-blur rounded-xl shadow-sm border">
+          {showWidgetCloseButtons && (
+            <button
+              type="button"
+              onClick={() => { void handleCandidateVisibilityToggle('hrm-candidates-sec-table', true); }}
+              className="absolute top-3 right-3 z-20 flex h-7 w-7 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+              title="Hide section"
+              aria-label="Hide candidate table section"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18" />
+                <path d="m6 6 12 12" />
+              </svg>
+            </button>
+          )}
           <table className="min-w-full">
             <thead className="bg-gray-50">
               <tr>
-                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">Code</th>
-                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">Name</th>
-                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">Email</th>
-                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">Phone</th>
-                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">Position</th>
-                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">Status</th>
-                <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">Actions</th>
+                {isColumnVisible('hrm-candidates-col-code') && (
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">
+                    <div className="flex items-center gap-2">
+                      <span>Code</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleCandidateVisibilityToggle('hrm-candidates-col-code', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Code column"
+                          aria-label="Hide Code column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('hrm-candidates-col-name') && (
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">
+                    <div className="flex items-center gap-2">
+                      <span>Name</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleCandidateVisibilityToggle('hrm-candidates-col-name', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Name column"
+                          aria-label="Hide Name column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('hrm-candidates-col-email') && (
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">
+                    <div className="flex items-center gap-2">
+                      <span>Email</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleCandidateVisibilityToggle('hrm-candidates-col-email', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Email column"
+                          aria-label="Hide Email column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('hrm-candidates-col-phone') && (
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">
+                    <div className="flex items-center gap-2">
+                      <span>Phone</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleCandidateVisibilityToggle('hrm-candidates-col-phone', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Phone column"
+                          aria-label="Hide Phone column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('hrm-candidates-col-position') && (
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">
+                    <div className="flex items-center gap-2">
+                      <span>Position</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleCandidateVisibilityToggle('hrm-candidates-col-position', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Position column"
+                          aria-label="Hide Position column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('hrm-candidates-col-status') && (
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">
+                    <div className="flex items-center gap-2">
+                      <span>Status</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleCandidateVisibilityToggle('hrm-candidates-col-status', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Status column"
+                          aria-label="Hide Status column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
+                {isColumnVisible('hrm-candidates-col-actions') && (
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600">
+                    <div className="flex items-center gap-2">
+                      <span>Actions</span>
+                      {showWidgetCloseButtons && (
+                        <button
+                          type="button"
+                          onClick={() => { void handleCandidateVisibilityToggle('hrm-candidates-col-actions', true); }}
+                          className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-100 text-rose-700 hover:bg-rose-200"
+                          title="Hide Actions column"
+                          aria-label="Hide Actions column"
+                        >
+                          <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M18 6 6 18" />
+                            <path d="m6 6 12 12" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </th>
+                )}
               </tr>
             </thead>
             <tbody>
               {candidates.map((candidate) => (
                 <tr key={candidate.id} className="border-t">
-                  <td className="px-6 py-4 text-sm text-gray-700">{candidate.candidate_code}</td>
-                  <td className="px-6 py-4 text-sm text-gray-900">{candidate.first_name} {candidate.last_name}</td>
-                  <td className="px-6 py-4 text-sm text-gray-700">{candidate.email}</td>
-                  <td className="px-6 py-4 text-sm text-gray-700">{candidate.phone}</td>
-                  <td className="px-6 py-4 text-sm text-gray-700">{candidate.position_applied}</td>
-                  <td className="px-6 py-4 text-sm">
-                    <span className={`px-2 py-1 rounded-full text-xs ${getStatusColor(candidate.status)}`}>{candidate.status}</span>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                  {isColumnVisible('hrm-candidates-col-code') && (
+                    <td className="px-6 py-4 text-sm text-gray-700">{candidate.candidate_code}</td>
+                  )}
+                  {isColumnVisible('hrm-candidates-col-name') && (
+                    <td className="px-6 py-4 text-sm text-gray-900">{candidate.first_name} {candidate.last_name}</td>
+                  )}
+                  {isColumnVisible('hrm-candidates-col-email') && (
+                    <td className="px-6 py-4 text-sm text-gray-700">{candidate.email}</td>
+                  )}
+                  {isColumnVisible('hrm-candidates-col-phone') && (
+                    <td className="px-6 py-4 text-sm text-gray-700">{candidate.phone}</td>
+                  )}
+                  {isColumnVisible('hrm-candidates-col-position') && (
+                    <td className="px-6 py-4 text-sm text-gray-700">{candidate.position_applied}</td>
+                  )}
+                  {isColumnVisible('hrm-candidates-col-status') && (
+                    <td className="px-6 py-4 text-sm">
+                      <span className={`px-2 py-1 rounded-full text-xs ${getStatusColor(candidate.status)}`}>{candidate.status}</span>
+                    </td>
+                  )}
+                  {isColumnVisible('hrm-candidates-col-actions') && (
+                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
                     <div className="relative inline-block" ref={openMenuFor === candidate.id ? menuRef : undefined}>
                       <button
                         aria-haspopup="menu"
@@ -977,12 +1306,14 @@ export default function Candidates() {
                         </div>
                       )}
                     </div>
-                  </td>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
+        )}
       </main>
 
       {/* Notification Modal */}

@@ -15,8 +15,21 @@ use Illuminate\Validation\ValidationException;
 
 class JobCardDocumentController extends Controller
 {
+    private function tenantContext(Request $request): array
+    {
+        $tenantId = (int) $request->input('tenant_id', $request->attributes->get('tenant_id') ?? 0);
+        $branchId = (int) $request->input('branch_id', $request->attributes->get('branch_id') ?? 0);
+
+        return [$tenantId, $branchId];
+    }
+
     public function index(Request $request, JobCard $jobCard): JsonResponse
     {
+        [$tenantId, $branchId] = $this->tenantContext($request);
+        if (($tenantId > 0 && (int) $jobCard->tenant_id !== $tenantId) || ($branchId > 0 && (int) $jobCard->branch_id !== $branchId)) {
+            return response()->json(['success' => false, 'message' => 'Unauthorized job card access.'], 403);
+        }
+
         $query = $jobCard->documents()->with(['items', 'serviceCustomer'])->orderByDesc('created_at');
 
         if ($request->filled('type')) {
@@ -31,6 +44,11 @@ class JobCardDocumentController extends Controller
 
     public function store(Request $request, JobCard $jobCard): JsonResponse
     {
+        [$tenantId, $branchId] = $this->tenantContext($request);
+        if (($tenantId > 0 && (int) $jobCard->tenant_id !== $tenantId) || ($branchId > 0 && (int) $jobCard->branch_id !== $branchId)) {
+            return response()->json(['success' => false, 'message' => 'Unauthorized job card access.'], 403);
+        }
+
         $validated = $request->validate([
             'document_type' => 'required|in:quotation,invoice',
             'document_date' => 'required|date',
@@ -58,7 +76,7 @@ class JobCardDocumentController extends Controller
             ]);
         }
 
-        $document = DB::transaction(function () use ($validated, $jobCard, $request) {
+        $document = DB::transaction(function () use ($validated, $jobCard, $request, $tenantId, $branchId) {
             $items = $validated['items'];
             unset($validated['items']);
 
@@ -105,7 +123,9 @@ class JobCardDocumentController extends Controller
                 $validated = array_merge($validated, $paymentMeta);
                 $validated['service_customer_id'] = $this->syncServiceCustomerForInvoice(
                     $jobCard,
-                    (float) ($paymentMeta['balance_amount'] ?? 0)
+                    (float) ($paymentMeta['balance_amount'] ?? 0),
+                    $tenantId,
+                    $branchId
                 );
             }
 
@@ -145,6 +165,17 @@ class JobCardDocumentController extends Controller
 
     public function show(JobCardDocument $jobCardDocument): JsonResponse
     {
+        $jobCardDocument->loadMissing('jobCard:id,tenant_id,branch_id');
+        $tenantId = (int) request()->input('tenant_id', request()->attributes->get('tenant_id') ?? 0);
+        $branchId = (int) request()->input('branch_id', request()->attributes->get('branch_id') ?? 0);
+
+        if (
+            ($tenantId > 0 && (int) ($jobCardDocument->jobCard?->tenant_id ?? 0) !== $tenantId)
+            || ($branchId > 0 && (int) ($jobCardDocument->jobCard?->branch_id ?? 0) !== $branchId)
+        ) {
+            return response()->json(['success' => false, 'message' => 'Unauthorized document access.'], 403);
+        }
+
         $jobCardDocument->load([
             'items.inventoryItem',
             'jobCard.assignedEmployee:id,first_name,last_name,employee_code',
@@ -160,6 +191,12 @@ class JobCardDocumentController extends Controller
 
     public function latestQuotation(JobCard $jobCard): JsonResponse
     {
+        $tenantId = (int) request()->input('tenant_id', request()->attributes->get('tenant_id') ?? 0);
+        $branchId = (int) request()->input('branch_id', request()->attributes->get('branch_id') ?? 0);
+        if (($tenantId > 0 && (int) $jobCard->tenant_id !== $tenantId) || ($branchId > 0 && (int) $jobCard->branch_id !== $branchId)) {
+            return response()->json(['success' => false, 'message' => 'Unauthorized job card access.'], 403);
+        }
+
         $quotation = $jobCard->documents()
             ->with('items')
             ->where('document_type', 'quotation')
@@ -301,11 +338,15 @@ class JobCardDocumentController extends Controller
         ];
     }
 
-    private function syncServiceCustomerForInvoice(JobCard $jobCard, float $balanceAmount): int
+    private function syncServiceCustomerForInvoice(JobCard $jobCard, float $balanceAmount, int $tenantId, int $branchId): int
     {
         $customer = ServiceCustomer::query()->firstOrCreate(
-            ['phone' => $jobCard->customer_phone],
             [
+                'tenant_id' => $tenantId,
+                'phone' => $jobCard->customer_phone,
+            ],
+            [
+                'branch_id' => $branchId,
                 'name' => $jobCard->customer_name,
                 'email' => $jobCard->customer_email,
             ]
@@ -340,6 +381,8 @@ class JobCardDocumentController extends Controller
         }
 
         MainCashTransaction::create([
+            'tenant_id' => (int) $jobCard->tenant_id,
+            'branch_id' => (int) $jobCard->branch_id,
             'date' => $validated['document_date'] ?? now(),
             'type' => 'in',
             'amount' => $paidAmount,

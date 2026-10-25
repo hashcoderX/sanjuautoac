@@ -9,6 +9,8 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 class Outlet extends Model
 {
     protected $fillable = [
+        'tenant_id',
+        'branch_id',
         'name',
         'code',
         'manager_name',

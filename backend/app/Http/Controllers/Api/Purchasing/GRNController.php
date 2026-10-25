@@ -11,15 +11,57 @@ use App\Models\PurchaseOrder;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
 
 class GRNController extends Controller
 {
+    private function tenantContext(Request $request): array
+    {
+        $user = $request->user();
+        $tenantId = (int) $request->input(
+            'tenant_id',
+            $request->attributes->get('tenant_id')
+                ?? $user?->employee?->tenant_id
+                ?? $user?->branch_id
+                ?? 0
+        );
+        $branchId = (int) $request->input(
+            'branch_id',
+            $request->attributes->get('branch_id')
+                ?? $user?->employee?->branch_id
+                ?? $user?->branch_id
+                ?? 0
+        );
+
+        return [$tenantId, $branchId];
+    }
+
+    private function ensureGrnOwnership(Request $request, GoodsReceivedNote $grn): ?JsonResponse
+    {
+        [$tenantId, $branchId] = $this->tenantContext($request);
+
+        if (($tenantId > 0 && (int) $grn->tenant_id !== $tenantId)
+            || ($branchId > 0 && (int) $grn->branch_id !== $branchId)) {
+            return response()->json(['message' => 'Unauthorized GRN access.'], 403);
+        }
+
+        return null;
+    }
+
     /**
      * Display a listing of the resource.
      */
     public function index(Request $request): JsonResponse
     {
+        [$tenantId, $branchId] = $this->tenantContext($request);
         $query = GoodsReceivedNote::with(['purchaseOrder.supplier', 'grnItems.purchaseOrderItem.inventoryItem']);
+
+        if ($tenantId > 0) {
+            $query->where('tenant_id', $tenantId);
+        }
+        if ($branchId > 0) {
+            $query->where('branch_id', $branchId);
+        }
 
         if ($request->filled('search')) {
             $search = $request->search;
@@ -66,14 +108,28 @@ class GRNController extends Controller
      */
     public function store(Request $request): JsonResponse
     {
+        [$tenantId, $branchId] = $this->tenantContext($request);
+        if ($tenantId <= 0 || $branchId <= 0) {
+            return response()->json(['message' => 'Tenant context is missing.'], 422);
+        }
+
         $validated = $request->validate([
-            'purchase_order_id' => 'required|exists:purchase_orders,id',
+            'purchase_order_id' => [
+                'required',
+                Rule::exists('purchase_orders', 'id')->where(function ($query) use ($tenantId, $branchId) {
+                    return $query->where('tenant_id', $tenantId)->where('branch_id', $branchId);
+                }),
+            ],
             'received_date' => 'required|date',
             'notes' => 'nullable|string',
             'discount_amount' => 'nullable|numeric|min:0',
             'payment_timing' => 'required|in:post_payment,on_time',
-            'payment_type' => 'nullable|required_if:payment_timing,on_time|string|max:120',
+            'payment_type' => 'nullable|string|max:120',
             'payment_reference' => 'nullable|string|max:255',
+            'payment_breakdown' => 'nullable|array',
+            'payment_breakdown.*.payment_type' => 'required_with:payment_breakdown|in:cash,bank_transfer,bank_deposit,cheque,party_cheque,card',
+            'payment_breakdown.*.payment_reference' => 'nullable|string|max:255',
+            'payment_breakdown.*.paid_amount' => 'required_with:payment_breakdown|numeric|min:0.01',
             'paid_amount' => 'nullable|numeric|min:0',
             'items' => 'required|array',
             'items.*.purchase_order_item_id' => 'required|exists:purchase_order_items,id',
@@ -87,7 +143,10 @@ class GRNController extends Controller
             'items.*.quality_status' => 'nullable|in:pending,accepted,rejected,partial',
         ]);
 
-        $purchaseOrder = PurchaseOrder::with('items')->findOrFail($validated['purchase_order_id']);
+        $purchaseOrder = PurchaseOrder::with('items')
+            ->where('tenant_id', $tenantId)
+            ->where('branch_id', $branchId)
+            ->findOrFail($validated['purchase_order_id']);
         $allowedPoItemIds = $purchaseOrder->items->pluck('id')->all();
         foreach ($validated['items'] as $line) {
             if (!in_array((int) $line['purchase_order_item_id'], $allowedPoItemIds, true)) {
@@ -115,19 +174,46 @@ class GRNController extends Controller
             ], 422);
         }
 
+        $paymentTiming = (string) ($validated['payment_timing'] ?? 'post_payment');
+        $paymentBreakdown = $paymentTiming === 'on_time'
+            ? $this->normalizePaymentBreakdown($validated['payment_breakdown'] ?? [])
+            : null;
+
+        if ($paymentTiming === 'on_time' && empty($paymentBreakdown) && empty($validated['payment_type'])) {
+            return response()->json([
+                'message' => 'Validation failed',
+                'errors' => [
+                    'payment_type' => ['Payment type is required for on-time payment when split payments are not provided.'],
+                ],
+            ], 422);
+        }
+
         $inputPaidAmount = (float) ($validated['paid_amount'] ?? 0);
-        $normalizedPaidAmount = min(max($inputPaidAmount, 0), $amounts['net_amount']);
+        $breakdownPaidAmount = $paymentBreakdown ? $this->calculateBreakdownTotal($paymentBreakdown) : 0.0;
+        $resolvedPaidAmount = $breakdownPaidAmount > 0 ? $breakdownPaidAmount : $inputPaidAmount;
+        $normalizedPaidAmount = min(max($resolvedPaidAmount, 0), $amounts['net_amount']);
+
+        if ($paymentBreakdown && $breakdownPaidAmount > $amounts['net_amount']) {
+            return response()->json([
+                'message' => 'Validation failed',
+                'errors' => [
+                    'payment_breakdown' => ['Split payment total cannot exceed the GRN net amount.'],
+                ],
+            ], 422);
+        }
+
         $paymentStatus = $amounts['net_amount'] <= 0
             ? 'paid'
             : ($normalizedPaidAmount <= 0
                 ? 'unpaid'
                 : ($normalizedPaidAmount >= $amounts['net_amount'] ? 'paid' : 'partial'));
-        $paymentTiming = (string) ($validated['payment_timing'] ?? 'post_payment');
         $paymentType = $paymentTiming === 'on_time' ? ($validated['payment_type'] ?? null) : null;
         $paymentReference = $paymentTiming === 'on_time' ? ($validated['payment_reference'] ?? null) : null;
 
-        $grn = DB::transaction(function () use ($validated, $amounts, $normalizedPaidAmount, $paymentStatus, $paymentTiming, $paymentType, $paymentReference) {
+        $grn = DB::transaction(function () use ($validated, $amounts, $normalizedPaidAmount, $paymentStatus, $paymentTiming, $paymentType, $paymentReference, $paymentBreakdown, $tenantId, $branchId) {
             $grn = GoodsReceivedNote::create([
+            'tenant_id' => $tenantId,
+            'branch_id' => $branchId,
                 'purchase_order_id' => $validated['purchase_order_id'],
                 'received_date' => $validated['received_date'],
                 'notes' => $validated['notes'] ?? null,
@@ -139,6 +225,7 @@ class GRNController extends Controller
                 'payment_timing' => $paymentTiming,
                 'payment_type' => $paymentType,
                 'payment_reference' => $paymentReference,
+                'payment_breakdown' => $paymentTiming === 'on_time' ? $paymentBreakdown : null,
                 'paid_amount' => $normalizedPaidAmount,
                 'paid_at' => $normalizedPaidAmount > 0 ? now() : null,
                 'payment_note' => null,
@@ -181,7 +268,7 @@ class GRNController extends Controller
             }
 
             $pendingAmount = $this->calculatePendingAmount((float) $amounts['net_amount'], (float) $normalizedPaidAmount);
-            $this->syncSupplierOutstandingByPurchaseOrder((int) $validated['purchase_order_id'], 0, $pendingAmount);
+            $this->syncSupplierOutstandingByPurchaseOrder((int) $validated['purchase_order_id'], 0, $pendingAmount, $tenantId, $branchId);
 
             return $grn;
         });
@@ -192,8 +279,12 @@ class GRNController extends Controller
     /**
      * Display the specified resource.
      */
-    public function show(GoodsReceivedNote $grn): JsonResponse
+    public function show(Request $request, GoodsReceivedNote $grn): JsonResponse
     {
+        if ($response = $this->ensureGrnOwnership($request, $grn)) {
+            return $response;
+        }
+
         return response()->json($grn->load(['purchaseOrder.supplier', 'grnItems.purchaseOrderItem.inventoryItem']));
     }
 
@@ -202,14 +293,23 @@ class GRNController extends Controller
      */
     public function update(Request $request, GoodsReceivedNote $grn): JsonResponse
     {
+        if ($response = $this->ensureGrnOwnership($request, $grn)) {
+            return $response;
+        }
+
+        [$tenantId, $branchId] = $this->tenantContext($request);
         $validated = $request->validate([
             'received_date' => 'sometimes|required|date',
             'notes' => 'nullable|string',
             'status' => 'sometimes|required|in:draft,received,inspected,approved,rejected',
             'discount_amount' => 'nullable|numeric|min:0',
             'payment_timing' => 'sometimes|required|in:post_payment,on_time',
-            'payment_type' => 'nullable|required_if:payment_timing,on_time|string|max:120',
+            'payment_type' => 'nullable|string|max:120',
             'payment_reference' => 'nullable|string|max:255',
+            'payment_breakdown' => 'nullable|array',
+            'payment_breakdown.*.payment_type' => 'required_with:payment_breakdown|in:cash,bank_transfer,bank_deposit,cheque,party_cheque,card',
+            'payment_breakdown.*.payment_reference' => 'nullable|string|max:255',
+            'payment_breakdown.*.paid_amount' => 'required_with:payment_breakdown|numeric|min:0.01',
             'paid_amount' => 'nullable|numeric|min:0',
             'items' => 'sometimes|array',
             'items.*.purchase_order_item_id' => 'required_with:items|exists:purchase_order_items,id',
@@ -229,7 +329,10 @@ class GRNController extends Controller
                 $purchaseOrderId = (int) $validated['purchase_order_id'];
             }
 
-            $purchaseOrder = PurchaseOrder::with('items')->findOrFail($purchaseOrderId);
+            $purchaseOrder = PurchaseOrder::with('items')
+                ->where('tenant_id', $tenantId)
+                ->where('branch_id', $branchId)
+                ->findOrFail($purchaseOrderId);
             $allowedPoItemIds = $purchaseOrder->items->pluck('id')->all();
             foreach ($validated['items'] as $line) {
                 if (!in_array((int) $line['purchase_order_item_id'], $allowedPoItemIds, true)) {
@@ -252,7 +355,7 @@ class GRNController extends Controller
             ], 422);
         }
 
-        DB::transaction(function () use (&$grn, $validated) {
+        DB::transaction(function () use (&$grn, $validated, $tenantId, $branchId) {
             $oldGrnItems = $grn->grnItems()->get()->keyBy('purchase_order_item_id');
             $oldPendingAmount = $this->calculatePendingAmount((float) $grn->net_amount, (float) $grn->paid_amount);
 
@@ -262,7 +365,10 @@ class GRNController extends Controller
 
             $newTotalAmount = (float) $grn->total_amount;
             if (isset($validated['items'])) {
-                $poForTotals = PurchaseOrder::with('items')->findOrFail((int) $grn->purchase_order_id);
+                $poForTotals = PurchaseOrder::with('items')
+                    ->where('tenant_id', $tenantId)
+                    ->where('branch_id', $branchId)
+                    ->findOrFail((int) $grn->purchase_order_id);
                 $financials = $this->calculateFinancials($validated['items'], $poForTotals, $discountAmount);
                 $newTotalAmount = $financials['total_amount'];
                 $discountAmount = $financials['discount_amount'];
@@ -272,10 +378,46 @@ class GRNController extends Controller
 
             $newNetAmount = round(max($newTotalAmount - $discountAmount, 0), 2);
             $incomingPaymentTiming = $validated['payment_timing'] ?? $grn->payment_timing ?? 'post_payment';
+            $incomingBreakdown = array_key_exists('payment_breakdown', $validated)
+                ? $this->normalizePaymentBreakdown($validated['payment_breakdown'] ?? [])
+                : ($grn->payment_breakdown ?? []);
+
+            if ($incomingPaymentTiming === 'on_time' && empty($incomingBreakdown) && empty($validated['payment_type']) && empty($grn->payment_type)) {
+                throw new \Illuminate\Validation\ValidationException(
+                    validator([], []),
+                    response()->json([
+                        'message' => 'Validation failed',
+                        'errors' => [
+                            'payment_type' => ['Payment type is required for on-time payment when split payments are not provided.'],
+                        ],
+                    ], 422)
+                );
+            }
+
+            $breakdownPaidAmount = $incomingPaymentTiming === 'on_time' && !empty($incomingBreakdown)
+                ? $this->calculateBreakdownTotal($incomingBreakdown)
+                : null;
+
             $incomingPaidAmount = array_key_exists('paid_amount', $validated)
                 ? (float) $validated['paid_amount']
                 : (float) $grn->paid_amount;
-            $existingPaidAmount = $incomingPaidAmount;
+
+            $existingPaidAmount = $breakdownPaidAmount !== null && $breakdownPaidAmount > 0
+                ? $breakdownPaidAmount
+                : $incomingPaidAmount;
+
+            if ($breakdownPaidAmount !== null && $breakdownPaidAmount > $newNetAmount) {
+                throw new \Illuminate\Validation\ValidationException(
+                    validator([], []),
+                    response()->json([
+                        'message' => 'Validation failed',
+                        'errors' => [
+                            'payment_breakdown' => ['Split payment total cannot exceed the GRN net amount.'],
+                        ],
+                    ], 422)
+                );
+            }
+
             $normalizedPaidAmount = min(max($existingPaidAmount, 0), $newNetAmount);
             $paymentStatus = $newNetAmount <= 0
                 ? 'paid'
@@ -302,12 +444,13 @@ class GRNController extends Controller
                 'payment_reference' => $incomingPaymentTiming === 'on_time'
                     ? ($validated['payment_reference'] ?? $grn->payment_reference)
                     : null,
+                'payment_breakdown' => $incomingPaymentTiming === 'on_time' ? $incomingBreakdown : null,
                 'paid_amount' => $normalizedPaidAmount,
                 'payment_status' => $paymentStatus,
                 'paid_at' => $paidAt,
             ]);
 
-            $this->syncSupplierOutstandingByPurchaseOrder((int) $grn->purchase_order_id, $oldPendingAmount, $newPendingAmount);
+            $this->syncSupplierOutstandingByPurchaseOrder((int) $grn->purchase_order_id, $oldPendingAmount, $newPendingAmount, $tenantId, $branchId);
 
             if (!isset($validated['items'])) {
                 return;
@@ -337,7 +480,9 @@ class GRNController extends Controller
                 $newAccepted = (float) optional($newGrnItems->get($poItemId))->accepted_quantity;
                 $diff = $newAccepted - $oldAccepted;
 
-                $purchaseOrderItem = PurchaseOrderItem::with('inventoryItem')->find($poItemId);
+                $purchaseOrderItem = PurchaseOrderItem::with('inventoryItem')
+                    ->where('purchase_order_id', $grn->purchase_order_id)
+                    ->find($poItemId);
                 if (!$purchaseOrderItem) {
                     continue;
                 }
@@ -363,6 +508,12 @@ class GRNController extends Controller
 
     public function recordPayment(Request $request, GoodsReceivedNote $grn): JsonResponse
     {
+        if ($response = $this->ensureGrnOwnership($request, $grn)) {
+            return $response;
+        }
+
+        [$tenantId, $branchId] = $this->tenantContext($request);
+
         if (($grn->payment_timing ?? 'post_payment') !== 'post_payment') {
             return response()->json([
                 'message' => 'Validation failed',
@@ -406,7 +557,7 @@ class GRNController extends Controller
             }
         }
 
-        DB::transaction(function () use (&$grn, $validated, $request) {
+        DB::transaction(function () use (&$grn, $validated, $request, $tenantId, $branchId) {
             $netAmount = (float) $grn->net_amount;
             $currentPaid = (float) $grn->paid_amount;
             $incomingPaid = (float) $validated['paid_amount'];
@@ -431,7 +582,9 @@ class GRNController extends Controller
 
             $selectedBankAccount = null;
             if (in_array(($validated['payment_type'] ?? ''), ['bank_transfer', 'bank_deposit'], true)) {
-                $selectedBankAccount = CompanyBankAccount::find((int) $validated['bank_account_id']);
+                $selectedBankAccount = CompanyBankAccount::query()
+                    ->where('company_id', $tenantId)
+                    ->find((int) $validated['bank_account_id']);
                 if (!$selectedBankAccount) {
                     throw new \Illuminate\Validation\ValidationException(
                         validator([], []),
@@ -472,6 +625,8 @@ class GRNController extends Controller
                 }
 
                 MainCashTransaction::create([
+                    'tenant_id' => $tenantId,
+                    'branch_id' => $branchId,
                     'date' => $validated['paid_at'] ?? now(),
                     'type' => 'out',
                     'amount' => $incomingPaid,
@@ -517,12 +672,21 @@ class GRNController extends Controller
                 'payment_status' => $paymentStatus,
                 'payment_type' => $validated['payment_type'] ?? $grn->payment_type,
                 'payment_reference' => $validated['payment_reference'] ?? $grn->payment_reference,
+                'payment_breakdown' => $this->appendPaymentBreakdownEntry(
+                    $grn->payment_breakdown,
+                    [
+                        'payment_type' => (string) ($validated['payment_type'] ?? ''),
+                        'payment_reference' => $validated['payment_reference'] ?? null,
+                        'paid_amount' => $incomingPaid,
+                        'paid_at' => $validated['paid_at'] ?? now()->toDateTimeString(),
+                    ]
+                ),
                 'paid_at' => $validated['paid_at'] ?? now(),
                 'payment_note' => $note !== '' ? $note : null,
             ]);
 
             $newPendingAmount = $this->calculatePendingAmount($netAmount, $newPaidAmount);
-            $this->syncSupplierOutstandingByPurchaseOrder((int) $grn->purchase_order_id, $oldPendingAmount, $newPendingAmount);
+            $this->syncSupplierOutstandingByPurchaseOrder((int) $grn->purchase_order_id, $oldPendingAmount, $newPendingAmount, $tenantId, $branchId);
 
             $grn = $grn->fresh();
         });
@@ -535,9 +699,15 @@ class GRNController extends Controller
     /**
      * Remove the specified resource from storage.
      */
-    public function destroy(GoodsReceivedNote $grn): JsonResponse
+    public function destroy(Request $request, GoodsReceivedNote $grn): JsonResponse
     {
-        DB::transaction(function () use ($grn) {
+        if ($response = $this->ensureGrnOwnership($request, $grn)) {
+            return $response;
+        }
+
+        [$tenantId, $branchId] = $this->tenantContext($request);
+
+        DB::transaction(function () use ($grn, $tenantId, $branchId) {
             $pendingAmount = $this->calculatePendingAmount((float) $grn->net_amount, (float) $grn->paid_amount);
 
             // Load GRN with relationships if not already loaded
@@ -558,7 +728,7 @@ class GRNController extends Controller
                 }
             }
 
-            $this->syncSupplierOutstandingByPurchaseOrder((int) $grn->purchase_order_id, $pendingAmount, 0);
+            $this->syncSupplierOutstandingByPurchaseOrder((int) $grn->purchase_order_id, $pendingAmount, 0, $tenantId, $branchId);
 
             $grn->delete();
         });
@@ -627,14 +797,17 @@ class GRNController extends Controller
         return round(max($netAmount - $paidAmount, 0), 2);
     }
 
-    private function syncSupplierOutstandingByPurchaseOrder(int $purchaseOrderId, float $oldPendingAmount, float $newPendingAmount): void
+    private function syncSupplierOutstandingByPurchaseOrder(int $purchaseOrderId, float $oldPendingAmount, float $newPendingAmount, int $tenantId, int $branchId): void
     {
         $delta = round($newPendingAmount - $oldPendingAmount, 2);
         if ($delta === 0.0) {
             return;
         }
 
-        $purchaseOrder = PurchaseOrder::with('supplier')->find($purchaseOrderId);
+        $purchaseOrder = PurchaseOrder::with('supplier')
+            ->where('tenant_id', $tenantId)
+            ->where('branch_id', $branchId)
+            ->find($purchaseOrderId);
         $supplier = $purchaseOrder?->supplier;
         if (!$supplier) {
             return;
@@ -643,5 +816,46 @@ class GRNController extends Controller
         $currentOutstanding = (float) ($supplier->outstanding_balance ?? 0);
         $supplier->outstanding_balance = max(0, round($currentOutstanding + $delta, 2));
         $supplier->save();
+    }
+
+    private function normalizePaymentBreakdown(array $rows): array
+    {
+        $normalized = [];
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+
+            $type = (string) ($row['payment_type'] ?? '');
+            $reference = isset($row['payment_reference']) ? (string) $row['payment_reference'] : null;
+            $amount = round(max((float) ($row['paid_amount'] ?? 0), 0), 2);
+            if ($type === '' || $amount <= 0) {
+                continue;
+            }
+
+            $normalized[] = [
+                'payment_type' => $type,
+                'payment_reference' => $reference,
+                'paid_amount' => $amount,
+            ];
+        }
+
+        return $normalized;
+    }
+
+    private function calculateBreakdownTotal(array $rows): float
+    {
+        $total = 0;
+        foreach ($rows as $row) {
+            $total += max((float) ($row['paid_amount'] ?? 0), 0);
+        }
+        return round($total, 2);
+    }
+
+    private function appendPaymentBreakdownEntry($existing, array $entry): array
+    {
+        $list = is_array($existing) ? $existing : [];
+        $list[] = $entry;
+        return $list;
     }
 }

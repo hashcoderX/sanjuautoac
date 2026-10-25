@@ -2,6 +2,8 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\GoodsReceivedNote;
+use App\Models\PurchaseOrder;
 use App\Models\Supplier;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
@@ -9,12 +11,42 @@ use Illuminate\Support\Facades\Validator;
 
 class SupplierController extends Controller
 {
+    private function tenantContext(Request $request): array
+    {
+        $user = $request->user();
+        $tenantId = (int) $request->input(
+            'tenant_id',
+            $request->attributes->get('tenant_id')
+                ?? $user?->employee?->tenant_id
+                ?? $user?->branch_id
+                ?? 0
+        );
+        $branchId = (int) $request->input(
+            'branch_id',
+            $request->attributes->get('branch_id')
+                ?? $user?->employee?->branch_id
+                ?? $user?->branch_id
+                ?? 0
+        );
+
+        return [$tenantId, $branchId];
+    }
+
     /**
      * Display a listing of the resource.
      */
     public function index(Request $request): JsonResponse
     {
+        [$tenantId, $branchId] = $this->tenantContext($request);
+
         $query = Supplier::query();
+
+        if ($tenantId > 0) {
+            $query->where('tenant_id', $tenantId);
+        }
+        if ($branchId > 0) {
+            $query->where('branch_id', $branchId);
+        }
 
         // Search functionality
         if ($request->has('search') && !empty($request->search)) {
@@ -48,6 +80,14 @@ class SupplierController extends Controller
      */
     public function store(Request $request): JsonResponse
     {
+        [$tenantId, $branchId] = $this->tenantContext($request);
+        if ($tenantId <= 0 || $branchId <= 0) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Tenant context is missing.',
+            ], 422);
+        }
+
         $validator = Validator::make($request->all(), [
             'name' => 'required|string|max:255',
             'contact_person' => 'required|string|max:255',
@@ -69,6 +109,8 @@ class SupplierController extends Controller
 
         try {
             $supplier = Supplier::create([
+                'tenant_id' => $tenantId,
+                'branch_id' => $branchId,
                 'name' => $request->name,
                 'contact_person' => $request->contact_person,
                 'email' => $request->email,
@@ -97,14 +139,97 @@ class SupplierController extends Controller
     /**
      * Display the specified resource.
      */
-    public function show(string $id): JsonResponse
+    public function show(Request $request, string $id): JsonResponse
     {
         try {
-            $supplier = Supplier::findOrFail($id);
+            [$tenantId, $branchId] = $this->tenantContext($request);
+            $supplierQuery = Supplier::query();
+            if ($tenantId > 0) {
+                $supplierQuery->where('tenant_id', $tenantId);
+            }
+            if ($branchId > 0) {
+                $supplierQuery->where('branch_id', $branchId);
+            }
+
+            $supplier = $supplierQuery->findOrFail($id);
+
+            $purchaseHistory = PurchaseOrder::query()
+                ->where('supplier_id', $supplier->id)
+                ->orderByDesc('order_date')
+                ->orderByDesc('id')
+                ->get([
+                    'id',
+                    'order_number',
+                    'order_date',
+                    'expected_delivery_date',
+                    'status',
+                    'total_amount',
+                    'notes',
+                    'created_at',
+                ]);
+
+            $paymentHistory = GoodsReceivedNote::query()
+                ->whereHas('purchaseOrder', function ($query) use ($supplier) {
+                    $query->where('supplier_id', $supplier->id);
+                })
+                ->with(['purchaseOrder:id,order_number'])
+                ->where('paid_amount', '>', 0)
+                ->orderByDesc('paid_at')
+                ->orderByDesc('id')
+                ->get([
+                    'id',
+                    'grn_number',
+                    'purchase_order_id',
+                    'received_date',
+                    'payment_status',
+                    'payment_timing',
+                    'payment_type',
+                    'payment_reference',
+                    'paid_amount',
+                    'paid_at',
+                    'payment_note',
+                    'net_amount',
+                ])
+                ->map(function (GoodsReceivedNote $grn) {
+                    $netAmount = (float) ($grn->net_amount ?? 0);
+                    $paidAmount = (float) ($grn->paid_amount ?? 0);
+
+                    return [
+                        'id' => $grn->id,
+                        'grn_number' => $grn->grn_number,
+                        'order_number' => $grn->purchaseOrder?->order_number,
+                        'received_date' => $grn->received_date,
+                        'payment_status' => $grn->payment_status,
+                        'payment_timing' => $grn->payment_timing,
+                        'payment_type' => $grn->payment_type,
+                        'payment_reference' => $grn->payment_reference,
+                        'paid_amount' => $paidAmount,
+                        'paid_at' => $grn->paid_at,
+                        'payment_note' => $grn->payment_note,
+                        'net_amount' => $netAmount,
+                        'balance_due' => max(0, round($netAmount - $paidAmount, 2)),
+                    ];
+                })
+                ->values();
+
+            $purchaseTotal = round((float) $purchaseHistory->sum('total_amount'), 2);
+            $paymentTotal = round((float) $paymentHistory->sum('paid_amount'), 2);
 
             return response()->json([
                 'success' => true,
-                'data' => $supplier,
+                'data' => [
+                    ...$supplier->toArray(),
+                    'purchase_summary' => [
+                        'total_orders' => $purchaseHistory->count(),
+                        'total_order_amount' => $purchaseTotal,
+                    ],
+                    'payment_summary' => [
+                        'total_payments' => $paymentHistory->count(),
+                        'total_paid_amount' => $paymentTotal,
+                    ],
+                    'purchase_history' => $purchaseHistory,
+                    'payment_history' => $paymentHistory,
+                ],
                 'message' => 'Supplier retrieved successfully'
             ]);
 
@@ -121,6 +246,8 @@ class SupplierController extends Controller
      */
     public function update(Request $request, string $id): JsonResponse
     {
+        [$tenantId, $branchId] = $this->tenantContext($request);
+
         $validator = Validator::make($request->all(), [
             'name' => 'required|string|max:255',
             'contact_person' => 'required|string|max:255',
@@ -141,7 +268,15 @@ class SupplierController extends Controller
         }
 
         try {
-            $supplier = Supplier::findOrFail($id);
+            $supplierQuery = Supplier::query();
+            if ($tenantId > 0) {
+                $supplierQuery->where('tenant_id', $tenantId);
+            }
+            if ($branchId > 0) {
+                $supplierQuery->where('branch_id', $branchId);
+            }
+
+            $supplier = $supplierQuery->findOrFail($id);
 
             $supplier->update([
                 'name' => $request->name,
@@ -177,10 +312,20 @@ class SupplierController extends Controller
     /**
      * Remove the specified resource from storage.
      */
-    public function destroy(string $id): JsonResponse
+    public function destroy(Request $request, string $id): JsonResponse
     {
         try {
-            $supplier = Supplier::findOrFail($id);
+            [$tenantId, $branchId] = $this->tenantContext($request);
+
+            $supplierQuery = Supplier::query();
+            if ($tenantId > 0) {
+                $supplierQuery->where('tenant_id', $tenantId);
+            }
+            if ($branchId > 0) {
+                $supplierQuery->where('branch_id', $branchId);
+            }
+
+            $supplier = $supplierQuery->findOrFail($id);
             $supplier->delete();
 
             return response()->json([
