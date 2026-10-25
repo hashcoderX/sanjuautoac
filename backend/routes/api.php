@@ -25,6 +25,7 @@ use App\Http\Controllers\Api\HR\EmployeeDocumentController;
 use App\Http\Controllers\Api\HR\EmployeeEducationController;
 use App\Http\Controllers\Api\HR\EmployeeExperienceController;
 use App\Http\Controllers\Api\Purchasing\GRNController;
+use App\Support\TenantTrial;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
@@ -49,7 +50,10 @@ Route::get('/user', function (Request $request) {
         }
     }
 
-    return $user;
+    $payload = $user->toArray();
+    $payload['trial'] = TenantTrial::resolveForUser($user);
+
+    return response()->json($payload);
 })->middleware('auth:sanctum');
 
 Route::get('/users', function (Request $request) {
@@ -82,14 +86,14 @@ Route::get('/users', function (Request $request) {
     }
 
     return User::where('branch_id', $branchId)->get();
-})->middleware(['auth:sanctum', 'tenant.scope']);
+})->middleware(['auth:sanctum', 'tenant.scope', 'trial.guard']);
 
 Route::post('/register', [AuthController::class, 'register']);
 Route::post('/login', [AuthController::class, 'login']);
 Route::post('/logout', [AuthController::class, 'logout'])->middleware('auth:sanctum');
 Route::post('/saas/join-requests', [SaasJoinRequestController::class, 'store']);
 
-Route::middleware(['auth:sanctum', 'tenant.scope'])->group(function () {
+Route::middleware(['auth:sanctum', 'tenant.scope', 'trial.guard'])->group(function () {
     Route::middleware('tenant.binding')->group(function () {
         Route::apiResource('companies', CompanyController::class);
         Route::get('petty-cash-transactions', [\App\Http\Controllers\PettyCashTransactionController::class, 'index']);

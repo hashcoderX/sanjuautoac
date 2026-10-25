@@ -1,6 +1,6 @@
 'use client';
 
-import { Suspense, useState } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useSearchParams } from 'next/navigation';
 import axios from 'axios';
@@ -15,6 +15,15 @@ function HomeContent() {
   const router = useRouter();
   const params = useSearchParams();
   const API_URL = process.env.NEXT_PUBLIC_API_BASE_URL || process.env.NEXT_PUBLIC_API_URL || '';
+
+  useEffect(() => {
+    if (params.get('reason') === 'trial_expired') {
+      showNotice(
+        'Trial Expired',
+        'Your trial has been blocked automatically after 14 days. Please buy Pro version to continue.'
+      );
+    }
+  }, [params]);
 
   const showNotice = (title: string, message: string) => {
     setNoticeTitle(title);

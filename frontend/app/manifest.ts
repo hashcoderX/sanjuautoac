@@ -2,9 +2,9 @@ import type { MetadataRoute } from "next";
 
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "ServiceOS",
-    short_name: "SO",
-    description: "ServiceOS - Business Management System with HRM, payroll, and operations.",
+    name: "Servio",
+    short_name: "Servio",
+    description: "Servio - Business Management System with HRM, payroll, and operations.",
     start_url: "/",
     display: "standalone",
     background_color: "#ffffff",

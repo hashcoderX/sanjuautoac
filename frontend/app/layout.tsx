@@ -2,13 +2,13 @@ import type { Metadata, Viewport } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: "ServiceOS",
-  description: "ServiceOS - Modern Business Management System with HRM",
+  title: "Servio",
+  description: "Servio - Modern Business Management System with HRM",
   manifest: "/manifest.webmanifest",
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
-    title: "ServiceOS",
+    title: "Servio",
   },
   icons: {
     icon: "/pabasara sweets.jpeg",

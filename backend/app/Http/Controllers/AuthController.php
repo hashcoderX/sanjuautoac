@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\SystemSetting;
 use App\Models\User;
+use App\Support\TenantTrial;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
@@ -92,11 +93,23 @@ class AuthController extends Controller
             ]);
         }
 
+        $trial = TenantTrial::resolveForUser($user);
+        if (($trial['status'] ?? null) === 'blocked') {
+            Auth::logout();
+
+            return response()->json([
+                'code' => 'trial_expired',
+                'message' => $trial['message'] ?? 'Trial period has ended. Please upgrade to Pro.',
+                'trial' => $trial,
+            ], 403);
+        }
+
         $token = $user->createToken('API Token')->plainTextToken;
 
         return response()->json([
             'user' => $user,
             'token' => $token,
+            'trial' => $trial,
         ]);
     }
 

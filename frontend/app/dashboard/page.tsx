@@ -14,17 +14,26 @@ type DashboardModule = {
   comingSoon?: boolean;
 };
 
+type TrialState = {
+  status?: 'active' | 'upgrade_required' | 'blocked' | 'exempt' | string;
+  message?: string | null;
+  trial_end_at?: string | null;
+  lock_at?: string | null;
+  days_until_lock?: number | null;
+};
+
 export default function Dashboard() {
   const [token, setToken] = useState('');
   const [userName, setUserName] = useState('');
   const [userEmail, setUserEmail] = useState('');
   const [userRole, setUserRole] = useState('');
-  const [companyName, setCompanyName] = useState('ServiceOS');
+  const [companyName, setCompanyName] = useState('Servio');
   const [widgetsFixed, setWidgetsFixed] = useState(false);
   const [isSuperAdminUser, setIsSuperAdminUser] = useState(false);
   const [superAdminUnlocked, setSuperAdminUnlocked] = useState(false);
   const [canManageFeatureVisibility, setCanManageFeatureVisibility] = useState(false);
   const [hiddenModules, setHiddenModules] = useState<string[]>([]);
+  const [trial, setTrial] = useState<TrialState | null>(null);
   const [accessReady, setAccessReady] = useState(false);
   const [showFixAuthModal, setShowFixAuthModal] = useState(false);
   const [fixAuthEmail, setFixAuthEmail] = useState('');
@@ -85,6 +94,7 @@ export default function Dashboard() {
           setCompanyName(name);
         }
       } catch (error) {
+        if (handleAuthFailure(error)) return;
         console.error('Error fetching company name:', error);
       }
     };
@@ -95,6 +105,23 @@ export default function Dashboard() {
   const handleLogout = () => {
     localStorage.removeItem('token');
     router.push('/');
+  };
+
+  const handleAuthFailure = (error: unknown): boolean => {
+    if (axios.isAxiosError(error) && error.response?.status === 401) {
+      localStorage.removeItem('token');
+      router.push('/');
+      return true;
+    }
+
+    if (axios.isAxiosError(error) && error.response?.status === 403 && error.response?.data?.code === 'trial_expired') {
+      localStorage.removeItem('token');
+      alert(error.response?.data?.message || 'Trial period ended. Please buy Pro version to continue.');
+      router.push('/dashboard/login?reason=trial_expired');
+      return true;
+    }
+
+    return false;
   };
 
   const applyWidgetsFixed = (nextValue: boolean) => {
@@ -183,6 +210,15 @@ export default function Dashboard() {
         });
 
         const userData = userRes.data || {};
+        const trialInfo = (userData?.trial || null) as TrialState | null;
+        setTrial(trialInfo);
+
+        if (trialInfo?.status === 'blocked') {
+          localStorage.removeItem('token');
+          router.push('/dashboard/login?reason=trial_expired');
+          return;
+        }
+
         const employeeId = Number(userData?.employee_id || userData?.employee?.id || 0);
         const roleNames = [
           String(userData?.role || ''),
@@ -227,6 +263,7 @@ export default function Dashboard() {
         setUserEmail(displayEmail);
         setUserRole(displayRole);
       } catch (error) {
+        if (handleAuthFailure(error)) return;
         console.error('Error fetching dashboard access profile:', error);
         setCanManageFeatureVisibility(false);
         setIsSuperAdminUser(false);
@@ -446,13 +483,23 @@ export default function Dashboard() {
       <main className="relative z-10 max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
         {/* Hero Section */}
         <div className="text-center mb-12">
+          {trial?.status === 'upgrade_required' && (
+            <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-left text-sm text-amber-900 shadow-sm">
+              <p className="font-semibold">Free trial ended. Please buy Pro version.</p>
+              <p className="mt-1 text-amber-800">
+                Access will be blocked automatically on {trial.lock_at || 'the lock date'}
+                {typeof trial.days_until_lock === 'number' ? ` (${trial.days_until_lock} day(s) left)` : ''}.
+              </p>
+            </div>
+          )}
+
           <div className="inline-block p-1 bg-gradient-to-r from-red-500 to-pink-500 rounded-full mb-6">
             <div className="bg-white rounded-full p-4">
               <span className="text-4xl">🚀</span>
             </div>
           </div>
           <h2 className="text-4xl md:text-5xl font-bold text-gray-900 mb-4">
-            Welcome to <span className="bg-gradient-to-r from-red-600 to-pink-600 bg-clip-text text-transparent">ServiceOS</span>
+            Welcome to <span className="bg-gradient-to-r from-red-600 to-pink-600 bg-clip-text text-transparent">Servio</span>
           </h2>
           <p className="text-lg sm:text-xl text-gray-600 max-w-3xl mx-auto leading-relaxed px-1">
             Transform your business operations with our comprehensive management suite.

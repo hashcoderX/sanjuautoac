@@ -4,7 +4,10 @@ import * as currencyCodes from 'currency-codes';
 import * as countries from 'i18n-iso-countries';
 import enCountryLocale from 'i18n-iso-countries/langs/en.json';
 import Link from 'next/link';
+import { Bricolage_Grotesque } from 'next/font/google';
 import { type ChangeEvent, type FormEvent, useEffect, useState } from 'react';
+
+const brandFont = Bricolage_Grotesque({ subsets: ['latin'], weight: ['700', '800'] });
 
 countries.registerLocale(enCountryLocale);
 
@@ -80,21 +83,21 @@ const businessTypes = [
 const pricingPlans = [
   {
     name: 'STARTER',
-    price: '$29',
+    price: '$10',
     note: 'For small workshops',
     features: ['1 branch', 'Up to 5 users', 'Job cards and invoicing', 'Basic reports'],
     highlighted: false,
   },
   {
     name: 'PROFESSIONAL',
-    price: '$79',
+    price: '$20',
     note: 'For growing service centers',
     features: ['Up to 3 branches', 'Up to 20 users', 'Inventory and purchasing', 'Advanced analytics'],
     highlighted: true,
   },
   {
     name: 'BUSINESS',
-    price: '$149',
+    price: '$30',
     note: 'For larger service operations',
     features: ['Multi-branch management', 'Unlimited users', 'HRM and accounts suite', 'Priority support'],
     highlighted: false,
@@ -274,12 +277,12 @@ export default function WebsiteLandingPage() {
     <main className="bg-[#f7f7f5] text-[#171717]">
       <header className="sticky top-0 z-50 border-b border-black/5 bg-[#f7f7f5]/90 backdrop-blur">
         <nav className="mx-auto flex h-16 w-full max-w-[1240px] items-center justify-between px-5 sm:px-8 lg:px-10">
-          <div className="flex items-center gap-3">
-            <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-[#e4552d] text-sm font-bold text-white">
-              SO
-            </span>
-            <span className="text-lg font-semibold tracking-tight">ServiceOS</span>
-          </div>
+          <Link
+            href="/website"
+            className={`${brandFont.className} text-2xl font-extrabold tracking-tight text-[#171717]`}
+          >
+            Serv<span className="text-[#e4552d]">io</span>
+          </Link>
 
           <ul className="hidden items-center gap-8 text-sm font-medium text-[#2e2e2e] lg:flex">
             <li>
@@ -779,7 +782,7 @@ export default function WebsiteLandingPage() {
                 </button>
                 {isOpen && (
                   <div className="px-5 pb-5 text-sm leading-6 text-[#666]">
-                    ServiceOS is cloud-based and built to simplify operations for modern service centers. Our team
+                    Servio is cloud-based and built to simplify operations for modern service centers. Our team
                     can guide your setup based on your workflow.
                   </div>
                 )}
@@ -810,16 +813,13 @@ export default function WebsiteLandingPage() {
       <footer className="bg-[#121417] py-14 text-white">
         <div className="mx-auto grid w-full max-w-[1240px] gap-10 px-5 sm:px-8 lg:grid-cols-5 lg:px-10">
           <div className="lg:col-span-2">
-            <div className="flex items-center gap-3">
-              <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-[#e4552d] text-sm font-bold text-white">
-                SO
-              </span>
-              <span className="text-lg font-semibold">ServiceOS</span>
+            <div className={`${brandFont.className} text-2xl font-extrabold tracking-tight`}>
+              Serv<span className="text-[#e4552d]">io</span>
             </div>
             <p className="mt-4 max-w-sm text-sm leading-6 text-white/70">
               Simple software for smarter service centers.
             </p>
-            <p className="mt-6 text-xs text-white/50">© {new Date().getFullYear()} ServiceOS. All rights reserved.</p>
+            <p className="mt-6 text-xs text-white/50">© {new Date().getFullYear()} Servio. All rights reserved.</p>
           </div>
           <div>
             <p className="text-sm font-semibold">Product</p>
@@ -855,7 +855,7 @@ export default function WebsiteLandingPage() {
           <div className="w-full max-w-2xl rounded-2xl border border-black/10 bg-white shadow-[0_30px_80px_rgba(0,0,0,0.3)]">
             <div className="flex items-center justify-between border-b border-black/10 px-6 py-4">
               <div>
-                <h3 className="text-lg font-semibold text-[#171717]">Join ServiceOS</h3>
+                <h3 className="text-lg font-semibold text-[#171717]">Join Servio</h3>
                 <p className="mt-1 text-sm text-[#666]">Tell us about your business and admin account details.</p>
               </div>
               <button

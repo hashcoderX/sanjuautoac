@@ -19,6 +19,7 @@ return Application::configure(basePath: dirname(__DIR__))
             'permission' => \App\Http\Middleware\CheckPermission::class,
             'tenant.scope' => \App\Http\Middleware\EnforceTenantScope::class,
             'tenant.binding' => \App\Http\Middleware\EnforceTenantRouteBindings::class,
+            'trial.guard' => \App\Http\Middleware\EnforceTrialAccess::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
